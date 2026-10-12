@@ -478,6 +478,28 @@ mod tests {
         Ok(())
     }
 
+    /// The up-front allocation for a tag field's data is capped at
+    /// `MAXIMUM_PREALLOCATED_TAG_DATA`, but a legitimate field larger than that must still
+    /// decode in full, the vec growing past the cap as bytes arrive.
+    #[test]
+    fn tag_field_larger_than_preallocation_cap_round_trips() -> Result<()> {
+        let data: Vec<u8> = (0..MAXIMUM_PREALLOCATED_TAG_DATA * 3)
+            .map(|i| u8::try_from(i % 251).expect("below 251"))
+            .collect();
+        let expected = TagField(42, data);
+
+        let mut encoder = crate::ser::Encoder::new(bytes::BytesMut::new());
+        expected.serialize(&mut encoder)?;
+        let encoded = bytes::Bytes::from(encoder);
+
+        let mut reader = Cursor::new(encoded);
+        let actual = TagField::deserialize(&mut crate::de::Decoder::new(&mut reader))?;
+
+        assert_eq!(expected, actual);
+
+        Ok(())
+    }
+
     /// `TagBuffer::decode` constructs its decoder from the tag field's own
     /// already-in-memory bytes, not a view onto remaining wire bytes, so the
     /// bound must be the tag field's own length. A claimed length far larger
