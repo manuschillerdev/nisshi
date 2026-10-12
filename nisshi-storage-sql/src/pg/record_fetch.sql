@@ -14,7 +14,16 @@
 -- limitations under the License.
 
 -- prepare record_fetch (text, text, integer, integer, integer, integer) as
-with sized as (
+-- A fetch reads at most 10000 rows past the fetch offset. The running byte total below is
+-- computed over every row that this query reads, so without the limit, one fetch costs as much
+-- as the whole backlog between the fetch offset and the high watermark, however few rows the
+-- client can take. The fetch service reads again from the last offset that it received, so a
+-- limit that ends a read early costs one more query.
+--
+-- The limit is inside a lateral join because a limit on the outer join does not stop the
+-- planner from reading and sorting every row in the range: it chooses a bitmap scan over the
+-- primary key, and the lateral form makes it walk the key in order and stop at the limit.
+with candidates as (
 select
 
 r.offset_id,
@@ -22,7 +31,6 @@ r.attributes,
 r.timestamp,
 r.k,
 r.v,
-sum(coalesce(length(r.k), 0) + coalesce(length(r.v), 0)) over (order by r.offset_id) as bytes,
 r.producer_id,
 r.producer_epoch
 
@@ -31,14 +39,42 @@ from
 cluster c
 join topic t on t.cluster = c.id
 join topition tp on tp.topic = t.id
-join record r on r.topition = tp.id
+cross join lateral (
+    select
+        r.offset_id,
+        r.attributes,
+        r.timestamp,
+        r.k,
+        r.v,
+        r.producer_id,
+        r.producer_epoch
+    from record r
+    where r.topition = tp.id
+    and r.offset_id >= $4
+    and r.offset_id < $6
+    order by r.offset_id
+    limit 10000) r
 
 where
 
 c.name = $1
 and t.name = $2
-and tp.partition = $3
-and r.offset_id >= $4
-and r.offset_id < $6)
+and tp.partition = $3),
+
+sized as (
+select
+
+offset_id,
+attributes,
+timestamp,
+k,
+v,
+sum(coalesce(length(k), 0) + coalesce(length(v), 0)) over (order by offset_id) as bytes,
+producer_id,
+producer_epoch
+
+from
+
+candidates)
 
 select * from sized where bytes < $5 order by offset_id;
