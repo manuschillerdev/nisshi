@@ -25,7 +25,7 @@
 
 use std::sync::{Arc, LazyLock};
 
-use fuzz::{check_request, check_response};
+use fuzz::{check_request, check_response, normalize_request};
 use libfuzzer_sys::fuzz_target;
 use nisshi_sans_io::CreateTopicsRequest;
 use nisshi_storage::{CreateTopicsService, CreateTopicsValidationLayer, StorageContainer};
@@ -43,6 +43,9 @@ static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| Runtime::new().expect("toki
 fuzz_target!(|request: CreateTopicsRequest| {
     RUNTIME.block_on(async {
         check_request(request.clone()).expect("encode/decode request");
+
+        // Serve what a client could actually have sent: the request as decoded off the wire.
+        let request = normalize_request(request).expect("normalized request");
 
         let mut builder = StorageContainer::builder()
             .cluster_id("fuzz")

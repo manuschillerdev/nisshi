@@ -14,7 +14,8 @@
 
 //! Fuzzes [`ListOffsetsService`] end-to-end against the in-memory storage backend,
 //! bypassing the wire protocol entirely: fuzzed bytes are turned directly
-//! into a [`ListOffsetsRequest`] via `nisshi-sans-io`'s `arbitrary` feature, then run
+//! into a [`ListOffsetsRequest`] via `nisshi-sans-io`'s `arbitrary` feature, normalized by an
+//! encode/decode round trip so it has the shape of a request off the wire, then run
 //! through the same service the broker routes `ListOffsets` requests to. This
 //! targets bugs in the storage/business logic (panics, mismatched
 //! invariants) rather than the wire decoder, which `fuzz_request_decode`
@@ -28,7 +29,7 @@
 
 use std::sync::{Arc, LazyLock};
 
-use fuzz::{check_request, check_response};
+use fuzz::{check_request, check_response, normalize_request};
 use libfuzzer_sys::fuzz_target;
 use nisshi_sans_io::ListOffsetsRequest;
 use nisshi_storage::{ListOffsetsService, StorageContainer};
@@ -42,6 +43,9 @@ static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| Runtime::new().expect("toki
 fuzz_target!(|request: ListOffsetsRequest| {
     RUNTIME.block_on(async {
         check_request(request.clone()).expect("encode/decode request");
+
+        // Serve what a client could actually have sent: the request as decoded off the wire.
+        let request = normalize_request(request).expect("normalized request");
 
         let mut builder = StorageContainer::builder()
             .cluster_id("fuzz")

@@ -56,6 +56,30 @@ where
     Ok(())
 }
 
+/// Encodes `request` at its `api_version` and decodes it again, returning the decoded request.
+///
+/// A fuzzed request is an arbitrary in-memory value, but a broker only ever serves what came off
+/// the wire. Feeding a service the decoded request keeps the inputs to shapes a client can
+/// actually send, e.g. a mandatory array left at `None` arrives as `Some(vec![])`, and fields
+/// outside the version's range arrive at their defaults.
+pub fn normalize_request<T>(request: T) -> Result<T, Error>
+where
+    T: Request,
+{
+    let header = Header::Request {
+        api_key: T::KEY,
+        api_version: api_version(&request),
+        correlation_id: 0,
+        client_id: Some("fuzzer".into()),
+    };
+
+    let body = Frame::request(header, request.into())
+        .and_then(Frame::request_from_bytes)
+        .map(|frame| frame.body)?;
+
+    T::try_from(body).map_err(|_| Error::Message("decoded the wrong request type".into()))
+}
+
 pub fn encode<T>(request: T) -> Result<Bytes, Error>
 where
     T: Request,
