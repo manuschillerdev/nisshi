@@ -24,12 +24,13 @@
 //! pre-seeded), so this mainly exercises not-found/empty-state handling;
 //! seeding realistic state first is a possible follow-up.
 //!
-//! NOTE: as of this writing, `nisshi-storage-dynostore`'s `create_topic`
-//! sibling `delete_records` is an unconditional `todo!()`, so this target
-//! currently panics on its very first execution. That is a pre-existing
-//! implementation gap this target surfaces, not something the fuzzer had to
-//! search for — it is kept here anyway for parity with the other services
-//! and so it starts finding *real* bugs the moment that stub is filled in.
+//! NOTE: as of this writing `delete_records` is an unconditional `todo!()` in
+//! `nisshi-storage-dynostore` and in the `lite` (libSQL) backend of `nisshi-storage-sql`,
+//! so a DeleteRecords request panics on `memory://`, `s3://`, `gs://` and `sqlite://`
+//! brokers, and this target panics on its very first execution. That is a pre-existing
+//! implementation gap this target surfaces, not something the fuzzer had to search for.
+//! It is kept here for parity with the other services, so it starts finding *real*
+//! bugs the moment those stubs are filled in.
 
 #![no_main]
 

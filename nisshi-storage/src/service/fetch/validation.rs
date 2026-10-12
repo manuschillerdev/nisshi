@@ -21,7 +21,7 @@ use nisshi_sans_io::{
     ErrorCode, FetchRequest, FetchResponse, IsolationLevel, RequestInput, fetch_request::FetchTopic,
 };
 use rama::{Layer, Service};
-use tracing::{debug, instrument};
+use tracing::{instrument, warn};
 
 use super::topic_error_response;
 use crate::{Error, Result};
@@ -44,6 +44,8 @@ pub struct ValidatedFetchRequest {
 /// The topics of a [`FetchRequest`] that failed to convert into a [`ValidatedFetchRequest`].
 #[derive(Clone, Debug)]
 pub struct MalformedFetchRequest {
+    field: &'static str,
+    value: i64,
     topics: Vec<FetchTopic>,
 }
 
@@ -91,16 +93,22 @@ impl TryFrom<FetchRequest> for ValidatedFetchRequest {
                 IsolationLevel::try_from,
             )
             .map_err(|_| MalformedFetchRequest {
+                field: "isolation_level",
+                value: request.isolation_level.map_or(0, i64::from),
                 topics: topics.clone(),
             })?;
 
         let max_wait = u64::try_from(request.max_wait_ms)
             .map(Duration::from_millis)
             .map_err(|_| MalformedFetchRequest {
+                field: "max_wait_ms",
+                value: i64::from(request.max_wait_ms),
                 topics: topics.clone(),
             })?;
 
         let min_bytes = u32::try_from(request.min_bytes).map_err(|_| MalformedFetchRequest {
+            field: "min_bytes",
+            value: i64::from(request.min_bytes),
             topics: topics.clone(),
         })?;
 
@@ -110,6 +118,8 @@ impl TryFrom<FetchRequest> for ValidatedFetchRequest {
                 u32::try_from(max_bytes).map(|max_bytes| max_bytes.min(DEFAULT_MAX_BYTES))
             })
             .map_err(|_| MalformedFetchRequest {
+                field: "max_bytes",
+                value: request.max_bytes.map_or(0, i64::from),
                 topics: topics.clone(),
             })?;
 
@@ -169,7 +179,11 @@ where
             Ok(request) => self.inner.serve(request).await,
 
             Err(malformed) => {
-                debug!(?malformed, "malformed fetch request");
+                warn!(
+                    field = malformed.field,
+                    value = malformed.value,
+                    "malformed fetch request, answering INVALID_REQUEST"
+                );
                 malformed.into_response()
             }
         }
@@ -290,6 +304,79 @@ mod tests {
 
         assert_eq!(Some(ErrorCode::None.into()), response.error_code);
         assert_eq!(1, inner.calls.load(std::sync::atomic::Ordering::SeqCst));
+
+        Ok(())
+    }
+
+    fn request_with(
+        isolation_level: Option<i8>,
+        max_wait_ms: i32,
+        min_bytes: i32,
+        max_bytes: Option<i32>,
+    ) -> FetchRequest {
+        FetchRequest::default()
+            .isolation_level(isolation_level)
+            .max_wait_ms(max_wait_ms)
+            .min_bytes(min_bytes)
+            .max_bytes(max_bytes)
+            .topics(Some(
+                [nisshi_sans_io::fetch_request::FetchTopic::default()
+                    .topic(Some("t".into()))
+                    .partitions(Some(
+                        [nisshi_sans_io::fetch_request::FetchPartition::default().partition(0)]
+                            .into(),
+                    ))]
+                .into(),
+            ))
+    }
+
+    /// Every malformed whole-request field is answered `INVALID_REQUEST` without calling the
+    /// inner service, and the answer survives an encode/decode round trip at the versions
+    /// that differ in how the response is laid out.
+    #[tokio::test]
+    async fn each_malformed_field_is_invalid_request_and_encodes() -> Result<()> {
+        use nisshi_sans_io::{ApiKey as _, Frame, Header};
+
+        for request in [
+            request_with(Some(7), 0, 0, None),
+            request_with(Some(0), -1, 0, None),
+            request_with(Some(0), 0, -1, None),
+            request_with(Some(0), 0, 0, Some(-1)),
+        ] {
+            let inner = CountingInner::default();
+            let service = FetchValidationLayer::new().layer(inner.clone());
+
+            let response = service
+                .serve(RequestInput {
+                    request,
+                    extensions: Extensions::default(),
+                })
+                .await?;
+
+            assert_eq!(0, inner.calls.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(Some(ErrorCode::InvalidRequest.into()), response.error_code);
+
+            let responses = response.responses.as_ref().expect("responses");
+            assert_eq!(1, responses.len());
+
+            let partitions = responses[0].partitions.as_ref().expect("partitions");
+            assert_eq!(
+                ErrorCode::InvalidRequest,
+                ErrorCode::try_from(partitions[0].error_code)?
+            );
+
+            for version in [4, 7, 11, 12, 13] {
+                let encoded = Frame::response(
+                    Header::Response { correlation_id: 0 },
+                    response.clone().into(),
+                    FetchResponse::KEY,
+                    version,
+                )?;
+
+                _ = Frame::response_from_bytes(encoded, FetchResponse::KEY, version)
+                    .unwrap_or_else(|err| panic!("decode at v{version}: {err}"));
+            }
+        }
 
         Ok(())
     }

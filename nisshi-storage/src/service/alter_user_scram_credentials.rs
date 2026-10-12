@@ -22,7 +22,7 @@ use nisshi_sans_io::{
 use rama::Service;
 use rsasl::mechanisms::scram::tools::derive_keys;
 use sha2::{Digest, Sha256, Sha512};
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
 
 #[derive(Clone, Debug)]
 pub struct AlterUserScramCredentialsService<G> {
@@ -52,7 +52,11 @@ where
                 let mechanism = match ScramMechanism::try_from(deletion.mechanism) {
                     Ok(mechanism) => mechanism,
                     Err(error) => {
-                        debug!(?error, "invalid scram mechanism");
+                        warn!(
+                            ?error,
+                            mechanism = deletion.mechanism,
+                            "invalid scram mechanism, answering UNSUPPORTED_SASL_MECHANISM"
+                        );
 
                         results.push(
                             AlterUserScramCredentialsResult::default()
@@ -92,7 +96,11 @@ where
                 {
                     Ok(mechanism) => mechanism,
                     Err(error) => {
-                        debug!(?error, "invalid scram mechanism");
+                        warn!(
+                            ?error,
+                            mechanism = upsertion.mechanism,
+                            "invalid scram mechanism, answering UNSUPPORTED_SASL_MECHANISM"
+                        );
 
                         results.push(
                             AlterUserScramCredentialsResult::default()

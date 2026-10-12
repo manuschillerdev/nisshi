@@ -29,7 +29,8 @@
 //! become available, up to `max_wait_ms`), independent of whether any
 //! requested topic exists. Left unclamped, an arbitrary `i32` there would
 //! make individual executions sleep for up to ~24.8 days instead of
-//! exercising new logic, so it is clamped to a few milliseconds below.
+//! exercising new logic, so it is capped at a few milliseconds below. Negative values are kept: they
+//! are rejected before any wait, so they reach the validation path cheaply.
 
 #![no_main]
 
@@ -48,7 +49,7 @@ static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| Runtime::new().expect("toki
 
 fuzz_target!(|request: FetchRequest| {
     let mut request = request;
-    request.max_wait_ms = request.max_wait_ms.clamp(0, 5);
+    request.max_wait_ms = request.max_wait_ms.min(5);
 
     RUNTIME.block_on(async {
         check_request(request.clone()).expect("encode/decode request");

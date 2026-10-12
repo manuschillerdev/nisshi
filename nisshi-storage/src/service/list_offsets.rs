@@ -20,7 +20,7 @@ use nisshi_sans_io::{
     list_offsets_response::{ListOffsetsPartitionResponse, ListOffsetsTopicResponse},
 };
 use rama::Service;
-use tracing::{debug, error, instrument};
+use tracing::{debug, error, instrument, warn};
 
 use crate::{Error, ListOffsetResponse, Result, Storage, Topition};
 
@@ -124,7 +124,7 @@ where
             Ok(isolation_level) => isolation_level,
 
             Err(error) => {
-                debug!(?error, "invalid isolation level");
+                warn!(?error, isolation_level = ?input.request.isolation_level, "invalid isolation level, answering INVALID_REQUEST");
 
                 return Ok(ListOffsetsResponse::default()
                     .throttle_time_ms(throttle_time_ms)
@@ -172,7 +172,12 @@ where
                             Ok(offset) => offsets.push((tp, offset)),
 
                             Err(error) => {
-                                debug!(?error, ?tp, "invalid timestamp");
+                                warn!(
+                                    ?error,
+                                    ?tp,
+                                    timestamp = partition.timestamp,
+                                    "invalid timestamp, answering INVALID_TIMESTAMP"
+                                );
 
                                 invalid_timestamps.push((
                                     tp,
