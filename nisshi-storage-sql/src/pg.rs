@@ -2384,6 +2384,35 @@ impl Storage for Postgres {
                         .inspect_err(|err| error!(?err))?,
                 );
 
+            // One query for the headers of the whole range. A query per record costs a
+            // round trip each, which capped a consumer at a few thousand records a second.
+            let mut headers: BTreeMap<i64, Vec<Row>> = BTreeMap::new();
+            if let Some(last) = records.last() {
+                let first_offset = first.try_get::<_, i64>(0)?;
+                let last_offset = last.try_get::<_, i64>(0)?;
+
+                for header in self
+                    .tx_prepare_query(
+                        &tx,
+                        "header_fetch_range.sql",
+                        &[
+                            &self.cluster,
+                            &topition.topic(),
+                            &topition.partition(),
+                            &first_offset,
+                            &last_offset,
+                        ],
+                    )
+                    .await
+                    .inspect_err(|err| error!(?err))?
+                {
+                    headers
+                        .entry(header.try_get::<_, i64>(0)?)
+                        .or_default()
+                        .push(header);
+                }
+            }
+
             for record in records.iter() {
                 let attributes = record
                     .try_get::<_, Option<i16>>(1)
@@ -2462,32 +2491,18 @@ impl Storage for Postgres {
                     .key(k)
                     .value(v);
 
-                for header in self
-                    .tx_prepare_query(
-                        &tx,
-                        "header_fetch.sql",
-                        &[
-                            &self.cluster,
-                            &topition.topic(),
-                            &topition.partition(),
-                            &offset,
-                        ],
-                    )
-                    .await
-                    .inspect(|row| debug!(?row))
-                    .inspect_err(|err| error!(?err))?
-                {
+                for header in headers.remove(&offset).unwrap_or_default() {
                     let mut header_builder = Header::builder();
 
                     if let Some(k) = header
-                        .try_get::<_, Option<&[u8]>>(0)
+                        .try_get::<_, Option<&[u8]>>(1)
                         .inspect_err(|err| error!(?err))?
                     {
                         header_builder = header_builder.key(Bytes::copy_from_slice(k));
                     }
 
                     if let Some(v) = header
-                        .try_get::<_, Option<&[u8]>>(1)
+                        .try_get::<_, Option<&[u8]>>(2)
                         .inspect_err(|err| error!(?err))?
                     {
                         header_builder = header_builder.value(Bytes::copy_from_slice(v));
