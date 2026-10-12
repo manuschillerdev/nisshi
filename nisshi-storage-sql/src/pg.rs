@@ -6800,4 +6800,197 @@ mod tests {
 
         Ok(())
     }
+
+    /// A storage on a new cluster holding one empty single-partition topic, or `None` when
+    /// there is no postgres to connect to.
+    async fn storage_with_topic() -> Result<Option<(Postgres, Topition)>> {
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping: {err:?}");
+            return Ok(None);
+        }
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster,
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(1)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        Ok(Some((storage, Topition::new(topic_name, 0))))
+    }
+
+    /// The records of every batch, as `(offset, record)`.
+    fn records_with_offsets(batches: Vec<deflated::Batch>) -> Result<Vec<(i64, Record)>> {
+        batches.into_iter().try_fold(Vec::new(), |mut acc, batch| {
+            let inflated = Batch::try_from(batch)?;
+
+            acc.extend(inflated.records.into_iter().map(|record| {
+                (
+                    inflated.base_offset + i64::from(record.offset_delta),
+                    record,
+                )
+            }));
+
+            Ok(acc)
+        })
+    }
+
+    /// The fetch query reads at most 10,000 rows per call. Without that bound each fetch
+    /// reads every row between the fetch offset and the high watermark, so a consumer behind
+    /// a fast producer slows down as its backlog grows. The fetch service reads again from
+    /// the last offset it received, so a bounded read must neither skip nor repeat a record.
+    #[tokio::test]
+    async fn fetch_reads_a_bounded_number_of_rows_and_resumes_after_them() -> Result<()> {
+        const ROWS_PER_FETCH: i64 = 10_000;
+        const RECORDS: i64 = ROWS_PER_FETCH + 50;
+
+        let Some((storage, topition)) = storage_with_topic().await? else {
+            return Ok(());
+        };
+
+        let batch = (0..RECORDS)
+            .fold(Batch::builder(), |builder, delta| {
+                builder.record(
+                    Record::builder()
+                        .value(Bytes::from_static(b"a").into())
+                        .offset_delta(i32::try_from(delta).unwrap_or(i32::MAX)),
+                )
+            })
+            .last_offset_delta(i32::try_from(RECORDS - 1)?)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage.produce(None, &topition, batch).await?;
+
+        let fetch_from = |offset| {
+            storage.fetch(
+                &topition,
+                offset,
+                1,
+                1024 * 1024,
+                IsolationLevel::ReadUncommitted,
+                Duration::from_secs(5),
+            )
+        };
+
+        let first = records_with_offsets(fetch_from(0).await?)?;
+
+        assert_eq!(
+            (0..ROWS_PER_FETCH).collect::<Vec<_>>(),
+            first.iter().map(|(offset, _)| *offset).collect::<Vec<_>>(),
+            "one fetch must stop at the row limit",
+        );
+
+        let rest = records_with_offsets(fetch_from(ROWS_PER_FETCH).await?)?;
+
+        assert_eq!(
+            (ROWS_PER_FETCH..RECORDS).collect::<Vec<_>>(),
+            rest.iter().map(|(offset, _)| *offset).collect::<Vec<_>>(),
+            "reading on from the last offset must return the rest, with no gap or repeat",
+        );
+
+        Ok(())
+    }
+
+    /// Headers are read for the whole range of a fetch at once, and each must end up on the
+    /// record at its own offset: records without headers stay without, and a record keeps its
+    /// headers in produce order.
+    #[tokio::test]
+    async fn fetch_attaches_each_header_to_its_own_record() -> Result<()> {
+        let Some((storage, topition)) = storage_with_topic().await? else {
+            return Ok(());
+        };
+
+        let headers: [&[&str]; 5] = [&[], &["one"], &[], &["two-a", "two-b"], &[]];
+
+        let batch = headers
+            .iter()
+            .enumerate()
+            .fold(Batch::builder(), |builder, (delta, keys)| {
+                builder.record(
+                    keys.iter().fold(
+                        Record::builder()
+                            .value(Bytes::from_static(b"a").into())
+                            .offset_delta(i32::try_from(delta).unwrap_or(i32::MAX)),
+                        |record, key| {
+                            record.header(
+                                Header::builder()
+                                    .key(Bytes::copy_from_slice(key.as_bytes()))
+                                    .value(Bytes::copy_from_slice(key.as_bytes())),
+                            )
+                        },
+                    ),
+                )
+            })
+            .last_offset_delta(i32::try_from(headers.len() - 1)?)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage.produce(None, &topition, batch).await?;
+
+        let records = records_with_offsets(
+            storage
+                .fetch(
+                    &topition,
+                    0,
+                    1,
+                    8 * 1024,
+                    IsolationLevel::ReadUncommitted,
+                    Duration::from_secs(5),
+                )
+                .await?,
+        )?;
+
+        let fetched = records
+            .iter()
+            .map(|(_, record)| {
+                record
+                    .headers
+                    .iter()
+                    .map(|header| {
+                        header
+                            .key
+                            .as_deref()
+                            .map(|key| String::from_utf8_lossy(key).into_owned())
+                            .unwrap_or_default()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            headers
+                .iter()
+                .map(|keys| keys.iter().map(|key| key.to_string()).collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            fetched,
+        );
+
+        Ok(())
+    }
 }
