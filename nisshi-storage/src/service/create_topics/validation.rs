@@ -57,7 +57,7 @@ const MAX_PARTITIONS_PER_REQUEST: i64 = 10_000;
 
 /// Partitions created for a topic whose `num_partitions` is `-1` (the
 /// "use the broker default" sentinel). Shared between the per-topic
-/// substitution in [`CreateTopicsService::serve`] and
+/// substitution in [`ValidatedCreateTopicsRequest::try_from`] and
 /// [`total_requested_partitions`], which must count a `-1` topic the same
 /// way the substitution below will.
 const BROKER_DEFAULT_NUM_PARTITIONS: i32 = 3;
