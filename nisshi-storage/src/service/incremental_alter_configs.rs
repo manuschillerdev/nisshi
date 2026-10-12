@@ -22,7 +22,7 @@ use crate::{Error, Result, Storage};
 
 /// A [`Service`] using its [`Storage`] taking [`IncrementalAlterConfigsRequest`] returning [`IncrementalAlterConfigsResponse`].
 /// ```no_run
-/// use rama::Service;
+/// use rama::{Layer as _, Service};
 /// use nisshi_sans_io::{
 ///     ConfigResource, CreateTopicsRequest, DescribeConfigsRequest, ErrorCode,
 ///     IncrementalAlterConfigsRequest, OpType,
@@ -31,7 +31,7 @@ use crate::{Error, Result, Storage};
 ///     incremental_alter_configs_request::{AlterConfigsResource, AlterableConfig},
 /// };
 /// use nisshi_storage::{
-///     CreateTopicsService, DescribeConfigsService, Error,
+///     CreateTopicsService, CreateTopicsValidationLayer, DescribeConfigsService, Error,
 ///     IncrementalAlterConfigsService, StorageContainer,
 /// };
 /// use url::Url;
@@ -52,9 +52,9 @@ use crate::{Error, Result, Storage};
 ///
 /// let resource_name = "abcba";
 ///
-/// let create_topic = CreateTopicsService {
+/// let create_topic = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
 ///     storage: storage.clone(),
-/// };
+/// });
 ///
 /// let response = create_topic
 ///     .serve(

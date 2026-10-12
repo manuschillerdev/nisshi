@@ -23,7 +23,8 @@ mod doctest_template {
         fetch_request::{FetchPartition, FetchTopic},
     };
     use nisshi_storage::{
-        CreateTopicsService, FetchService, FetchValidationLayer, StorageContainer,
+        CreateTopicsService, CreateTopicsValidationLayer, FetchService, FetchValidationLayer,
+        StorageContainer,
     };
     use rama::{Layer as _, Service, extensions::Extensions};
     use url::Url;
@@ -54,9 +55,9 @@ mod doctest_template {
 
         let extensions = Extensions::default();
 
-        let create_topic = CreateTopicsService {
+        let create_topic = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
             storage: storage.clone(),
-        };
+        });
 
         let name = "abcba";
 

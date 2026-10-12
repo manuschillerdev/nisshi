@@ -25,10 +25,10 @@ use nisshi_sans_io::{
     incremental_alter_configs_request::{AlterConfigsResource, AlterableConfig},
 };
 use nisshi_storage::{
-    ArcDynStorage, CreateTopicsService, DescribeConfigsService, IncrementalAlterConfigsService,
-    Storage,
+    ArcDynStorage, CreateTopicsService, CreateTopicsValidationLayer, DescribeConfigsService,
+    IncrementalAlterConfigsService, Storage,
 };
-use rama::{Service, extensions::Extensions};
+use rama::{Layer as _, Service, extensions::Extensions};
 use rand::{RngExt as _, rng};
 use tracing::debug;
 use uuid::Uuid;
@@ -36,9 +36,9 @@ use uuid::Uuid;
 async fn simple(storage: impl Storage + Clone) -> Result<()> {
     let resource_name = &alphanumeric_string(15)[..];
 
-    let create_topic = CreateTopicsService {
+    let create_topic = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
         storage: storage.clone(),
-    };
+    });
 
     let extensions = Extensions::default();
 

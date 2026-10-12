@@ -202,16 +202,18 @@ pub use proxy::SemaphoreProxy;
 
 pub use service::{
     AlterUserScramCredentialsService, ChannelRequestLayer, ChannelRequestService,
-    ConsumerGroupDescribeService, CreateAclsService, CreateTopicsService, DeleteGroupsService,
+    ConsumerGroupDescribeService, CreateAclsService, CreateTopicsService,
+    CreateTopicsValidationLayer, CreateTopicsValidationService, DeleteGroupsService,
     DeleteRecordsService, DeleteTopicsService, DescribeAclsService, DescribeClusterService,
     DescribeConfigsService, DescribeGroupsService, DescribeTopicPartitionsService,
     DescribeUserScramCredentialsService, FetchService, FetchValidationLayer,
     FetchValidationService, FindCoordinatorService, GetTelemetrySubscriptionsService,
     IncrementalAlterConfigsService, InitProducerIdService, ListGroupsService, ListOffsetsService,
-    ListPartitionReassignmentsService, MalformedFetchRequest, MetadataService, ProduceService,
-    Request, RequestChannelService, RequestLayer, RequestReceiver, RequestSender, RequestService,
-    RequestStorageService, Response, TxnAddOffsetsService, TxnAddPartitionService, TxnEndService,
-    TxnOffsetCommitService, ValidatedFetchRequest, bounded_channel,
+    ListPartitionReassignmentsService, MalformedCreateTopicsRequest, MalformedFetchRequest,
+    MetadataService, ProduceService, Request, RequestChannelService, RequestLayer, RequestReceiver,
+    RequestSender, RequestService, RequestStorageService, Response, TxnAddOffsetsService,
+    TxnAddPartitionService, TxnEndService, TxnOffsetCommitService, ValidatedCreateTopicsRequest,
+    ValidatedFetchRequest, bounded_channel,
 };
 
 #[cfg(feature = "dynostore")]

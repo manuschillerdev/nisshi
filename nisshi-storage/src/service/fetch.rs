@@ -62,7 +62,7 @@ pub(super) mod validation;
 ///     fetch_request::{FetchPartition, FetchTopic},
 /// };
 /// use nisshi_storage::{
-///     CreateTopicsService, Error, FetchService, FetchValidationLayer, StorageContainer,
+///     CreateTopicsService, CreateTopicsValidationLayer, Error, FetchService, FetchValidationLayer, StorageContainer,
 /// };
 /// use url::Url;
 ///
@@ -81,9 +81,9 @@ pub(super) mod validation;
 ///     .build()
 ///     .await?;
 ///
-/// let create_topic = CreateTopicsService {
+/// let create_topic = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
 ///     storage: storage.clone(),
-/// };
+/// });
 ///
 /// let name = "abcba";
 ///

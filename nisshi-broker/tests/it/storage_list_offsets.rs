@@ -24,17 +24,19 @@ use nisshi_sans_io::{
     create_topics_request::CreatableTopic,
     list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
 };
-use nisshi_storage::{ArcDynStorage, CreateTopicsService, ListOffsetsService, Storage};
-use rama::{Service, extensions::Extensions};
+use nisshi_storage::{
+    ArcDynStorage, CreateTopicsService, CreateTopicsValidationLayer, ListOffsetsService, Storage,
+};
+use rama::{Layer as _, Service, extensions::Extensions};
 use rand::{prelude::*, rng};
 use uuid::Uuid;
 
 async fn simple(storage: impl Storage + Clone, broker_id: i32) -> Result<()> {
     let extensions = Extensions::default();
 
-    let create_topic = CreateTopicsService {
+    let create_topic = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
         storage: storage.clone(),
-    };
+    });
 
     let topic = &alphanumeric_string(15)[..];
 
@@ -119,9 +121,9 @@ async fn simple(storage: impl Storage + Clone, broker_id: i32) -> Result<()> {
 async fn timestamp_no_match(storage: impl Storage + Clone, broker_id: i32) -> Result<()> {
     let extensions = Extensions::default();
 
-    let create_topic = CreateTopicsService {
+    let create_topic = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
         storage: storage.clone(),
-    };
+    });
 
     let topic = &alphanumeric_string(15)[..];
 
@@ -205,24 +207,25 @@ async fn invalid_timestamp_is_scoped_to_its_partition(
     let extensions = Extensions::default();
     let topic = &alphanumeric_string(15)[..];
 
-    let response = CreateTopicsService {
-        storage: storage.clone(),
-    }
-    .serve(RequestInput {
-        request: CreateTopicsRequest::default()
-            .validate_only(Some(false))
-            .topics(Some(
-                [CreatableTopic::default()
-                    .name(topic.into())
-                    .num_partitions(2)
-                    .replication_factor(1)
-                    .assignments(Some([].into()))
-                    .configs(Some([].into()))]
-                .into(),
-            )),
-        extensions: extensions.clone(),
-    })
-    .await?;
+    let response = CreateTopicsValidationLayer::new()
+        .layer(CreateTopicsService {
+            storage: storage.clone(),
+        })
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default()
+                .validate_only(Some(false))
+                .topics(Some(
+                    [CreatableTopic::default()
+                        .name(topic.into())
+                        .num_partitions(2)
+                        .replication_factor(1)
+                        .assignments(Some([].into()))
+                        .configs(Some([].into()))]
+                    .into(),
+                )),
+            extensions: extensions.clone(),
+        })
+        .await?;
 
     let created = response.topics.as_deref().unwrap_or_default();
     assert_eq!(ErrorCode::None, ErrorCode::try_from(created[0].error_code)?);

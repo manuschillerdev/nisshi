@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Fuzzes [`CreateTopicsService`] (the [`Storage::create_topic`] request
-//! handler) end-to-end against the in-memory storage backend, bypassing the
+//! Fuzzes [`CreateTopicsValidationLayer`] wrapping [`CreateTopicsService`] (the
+//! [`Storage::create_topic`] request handler) end-to-end against the in-memory storage backend, bypassing the
 //! wire protocol entirely: fuzzed bytes are turned directly into a
 //! [`CreateTopicsRequest`] via `nisshi-sans-io`'s `arbitrary` feature, then
 //! run through the same service the broker routes `CreateTopics` requests
@@ -28,16 +28,16 @@ use std::sync::{Arc, LazyLock};
 use fuzz::{check_request, check_response};
 use libfuzzer_sys::fuzz_target;
 use nisshi_sans_io::CreateTopicsRequest;
-use nisshi_storage::{CreateTopicsService, StorageContainer};
+use nisshi_storage::{CreateTopicsService, CreateTopicsValidationLayer, StorageContainer};
 use nisshi_storage_dynostore::MemoryEngineFactory;
-use rama::Service as _;
+use rama::{Layer as _, Service as _};
 use tokio::runtime::Runtime;
 use url::Url;
 
 static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| Runtime::new().expect("tokio runtime"));
 
-// `partitions` and `replication_factor` are deliberately left unclamped: `CreateTopicsService`
-// rejects out of range values (`INVALID_PARTITIONS`, `INVALID_REPLICATION_FACTOR`) and a request
+// `partitions` and `replication_factor` are deliberately left unclamped: `CreateTopicsValidationLayer`
+// rejects out of range values, explicit counts beside manual assignments (`INVALID_REQUEST`), (`INVALID_PARTITIONS`, `INVALID_REPLICATION_FACTOR`) and a request
 // totalling more than 10,000 partitions (`POLICY_VIOLATION`) before storage is consulted, so
 // an arbitrary `i32::MAX` cannot reach `create_topic`. Fuzzing the raw values checks that guard.
 fuzz_target!(|request: CreateTopicsRequest| {
@@ -57,7 +57,7 @@ fuzz_target!(|request: CreateTopicsRequest| {
             .await
             .expect("in-memory storage always builds");
 
-        let service = CreateTopicsService { storage };
+        let service = CreateTopicsValidationLayer::new().layer(CreateTopicsService { storage });
 
         service
             .serve(request)

@@ -33,7 +33,8 @@ use nisshi_sans_io::{
     },
 };
 use nisshi_storage::{
-    CreateTopicsService, Error, FetchService, FetchValidationLayer, ProduceService,
+    CreateTopicsService, CreateTopicsValidationLayer, Error, FetchService, FetchValidationLayer,
+    ProduceService,
 };
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
@@ -220,9 +221,9 @@ async fn empty_topic_5_000ms_max_wait() -> Result<(), Error> {
 
     let extensions = Extensions::default();
 
-    let create_topic = CreateTopicsService {
+    let create_topic = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
         storage: storage.clone(),
-    };
+    });
 
     let name = "pqr";
     let num_partitions = 5;
@@ -307,9 +308,9 @@ async fn empty_topic_50ms_max_wait() -> Result<(), Error> {
     let storage =
         DynoStore::new("nisshi", 12321, object_store).advertised_listener(advertised_listener);
 
-    let create_topic = CreateTopicsService {
+    let create_topic = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
         storage: storage.clone(),
-    };
+    });
 
     let name = "pqr";
     let num_partitions = 5;
@@ -394,9 +395,9 @@ async fn fetch_1_min_bytes_5_000ms_max_wait() -> Result<(), Error> {
     let storage =
         DynoStore::new("nisshi", 12321, object_store).advertised_listener(advertised_listener);
 
-    let create_topic = CreateTopicsService {
+    let create_topic = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
         storage: storage.clone(),
-    };
+    });
 
     let produce = ProduceService {
         storage: storage.clone(),
@@ -651,9 +652,9 @@ async fn fetch_1_min_bytes_max_wait_of_1x_latency() -> Result<(), Error> {
     let storage =
         DynoStore::new("nisshi", 12321, object_store).advertised_listener(advertised_listener);
 
-    let create_topic = CreateTopicsService {
+    let create_topic = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
         storage: storage.clone(),
-    };
+    });
 
     let produce = ProduceService {
         storage: storage.clone(),
@@ -806,9 +807,9 @@ async fn fetch_1_min_bytes_max_wait_of_2x_latency() -> Result<(), Error> {
     let storage =
         DynoStore::new("nisshi", 12321, object_store).advertised_listener(advertised_listener);
 
-    let create_topic = CreateTopicsService {
+    let create_topic = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
         storage: storage.clone(),
-    };
+    });
 
     let produce = ProduceService {
         storage: storage.clone(),
@@ -976,9 +977,9 @@ async fn fetch_max_bytes_for_1_message_5_000ms_max_wait() -> Result<(), Error> {
     let storage =
         DynoStore::new("nisshi", 12321, object_store).advertised_listener(advertised_listener);
 
-    let create_topic = CreateTopicsService {
+    let create_topic = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
         storage: storage.clone(),
-    };
+    });
 
     let produce = ProduceService {
         storage: storage.clone(),
@@ -1125,9 +1126,9 @@ async fn fetch_max_bytes_for_1_message_50ms_max_wait() -> Result<(), Error> {
     let storage =
         DynoStore::new("nisshi", 12321, object_store).advertised_listener(advertised_listener);
 
-    let create_topic = CreateTopicsService {
+    let create_topic = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
         storage: storage.clone(),
-    };
+    });
 
     let produce = ProduceService {
         storage: storage.clone(),
@@ -1275,9 +1276,9 @@ async fn fetch_max_bytes_for_2_messages_5_000ms_max_wait() -> Result<(), Error> 
     let storage =
         DynoStore::new("nisshi", 12321, object_store).advertised_listener(advertised_listener);
 
-    let create_topic = CreateTopicsService {
+    let create_topic = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
         storage: storage.clone(),
-    };
+    });
 
     let produce = ProduceService {
         storage: storage.clone(),
@@ -1439,9 +1440,9 @@ async fn fetch_max_bytes_for_2_messages_50ms_max_wait() -> Result<(), Error> {
     let storage =
         DynoStore::new("nisshi", 12321, object_store).advertised_listener(advertised_listener);
 
-    let create_topic = CreateTopicsService {
+    let create_topic = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
         storage: storage.clone(),
-    };
+    });
 
     let produce = ProduceService {
         storage: storage.clone(),

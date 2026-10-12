@@ -33,10 +33,10 @@ use nisshi_sans_io::{
     },
 };
 use nisshi_storage::{
-    ArcDynStorage, CreateTopicsService, DeleteTopicsService, InitProducerIdService,
-    ListOffsetsService, ProduceService, Storage,
+    ArcDynStorage, CreateTopicsService, CreateTopicsValidationLayer, DeleteTopicsService,
+    InitProducerIdService, ListOffsetsService, ProduceService, Storage,
 };
-use rama::{Service as _, extensions::Extensions};
+use rama::{Layer as _, Service as _, extensions::Extensions};
 use rand::{RngExt as _, rng};
 use tracing::debug;
 use uuid::Uuid;
@@ -71,9 +71,9 @@ async fn non_txn_idempotent_unknown_producer_id(storage: impl Storage + Clone) -
 
     let extensions = Extensions::default();
 
-    let create_topic = CreateTopicsService {
+    let create_topic = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
         storage: storage.clone(),
-    };
+    });
 
     let num_partitions = rng().random_range(1..64);
     let replication_factor = rng().random_range(1..64);
@@ -162,9 +162,9 @@ async fn non_txn_idempotent(storage: impl Storage + Clone) -> Result<()> {
 
     let extensions = Extensions::default();
 
-    let create_topic = CreateTopicsService {
+    let create_topic = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
         storage: storage.clone(),
-    };
+    });
 
     let num_partitions = rng().random_range(1..64);
     let replication_factor = rng().random_range(1..64);
@@ -358,9 +358,9 @@ async fn non_txn_idempotent_duplicate_sequence(storage: impl Storage + Clone) ->
 
     let extensions = Extensions::default();
 
-    let create_topic = CreateTopicsService {
+    let create_topic = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
         storage: storage.clone(),
-    };
+    });
 
     let num_partitions = rng().random_range(1..64);
     let replication_factor = rng().random_range(1..64);
@@ -517,9 +517,9 @@ async fn non_txn_idempotent_sequence_out_of_order(storage: impl Storage + Clone)
 
     let topic = &alphanumeric_string(15)[..];
 
-    let create_topic = CreateTopicsService {
+    let create_topic = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
         storage: storage.clone(),
-    };
+    });
 
     let num_partitions = rng().random_range(1..64);
     let replication_factor = rng().random_range(1..64);
@@ -659,9 +659,9 @@ async fn non_txn_idempotent_sequence_out_of_order(storage: impl Storage + Clone)
 async fn list_offsets(storage: impl Storage + Clone) -> Result<()> {
     let extensions = Extensions::default();
 
-    let create_topic = CreateTopicsService {
+    let create_topic = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
         storage: storage.clone(),
-    };
+    });
 
     let delete_topic = DeleteTopicsService {
         storage: storage.clone(),
@@ -904,9 +904,9 @@ async fn produce_rejects_last_offset_delta_mismatch(storage: impl Storage + Clon
 
     let extensions = Extensions::default();
 
-    let create_topic = CreateTopicsService {
+    let create_topic = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
         storage: storage.clone(),
-    };
+    });
 
     {
         let response = create_topic
@@ -1144,9 +1144,9 @@ async fn produce_rejects_last_offset_delta_mismatch(storage: impl Storage + Clon
 async fn produce_rejects_control_batch(storage: impl Storage + Clone) -> Result<()> {
     let extensions = Extensions::default();
 
-    let create_topic = CreateTopicsService {
+    let create_topic = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
         storage: storage.clone(),
-    };
+    });
 
     let produce = ProduceService {
         storage: storage.clone(),

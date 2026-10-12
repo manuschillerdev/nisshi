@@ -154,6 +154,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a different number, and a Windows host without IPv6 support failed to bind
   `[::]` instead of falling back to `0.0.0.0`.
 - A `Fetch` request with an invalid `isolation_level`, `max_wait_ms`, `min_bytes` or `max_bytes` gets `INVALID_REQUEST` on the response and on every requested partition, instead of an internal error. `FetchService` takes a `ValidatedFetchRequest`, which parses these fields once.
+- A `CreateTopics` topic with manual `assignments` and an explicit `num_partitions` or `replication_factor` gets `INVALID_REQUEST`, as in Kafka, instead of creating `num_partitions` partitions: a single request could ask the broker for millions and exhaust its memory, because the 10,000 partition cap counted only the assignments. `CreateTopicsService` takes a `ValidatedCreateTopicsRequest`, built by `CreateTopicsValidationLayer`.
 - A `ListOffsets` request with an invalid `isolation_level` gets `INVALID_REQUEST`, and one with an invalid timestamp gets `INVALID_TIMESTAMP` on that partition, instead of an internal error.
 - An `AlterUserScramCredentials` request with an unrecognized SASL mechanism gets `UNSUPPORTED_SASL_MECHANISM` on that item, instead of an internal error.
 - A `Fetch` or `Metadata` request for a topic with neither a name nor a topic id no longer panics.

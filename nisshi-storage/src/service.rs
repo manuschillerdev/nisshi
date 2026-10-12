@@ -48,7 +48,13 @@ pub use alter_user_scram_credentials::AlterUserScramCredentialsService;
 use async_trait::async_trait;
 pub use consumer_group_describe::ConsumerGroupDescribeService;
 pub use create_acls::CreateAclsService;
-pub use create_topics::CreateTopicsService;
+pub use create_topics::{
+    CreateTopicsService,
+    validation::{
+        CreateTopicsValidationLayer, CreateTopicsValidationService, MalformedCreateTopicsRequest,
+        ValidatedCreateTopicsRequest,
+    },
+};
 pub use delete_groups::DeleteGroupsService;
 pub use delete_records::DeleteRecordsService;
 pub use delete_topics::DeleteTopicsService;
