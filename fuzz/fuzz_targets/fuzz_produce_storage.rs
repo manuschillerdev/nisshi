@@ -58,10 +58,15 @@ fuzz_target!(|request: ProduceRequest| {
 
         let service = ProduceService { storage };
 
-        service
-            .serve(request)
-            .await
-            .and_then(|response| check_response(response).map_err(Into::into))
-            .expect("served and decoded")
+        match service.serve(request).await {
+            // The service returns this error so that the broker closes the connection of an
+            // `acks=0` client whose request failed; it is not a defect.
+            Err(nisshi_storage::Error::AcksZeroProduceFailed { .. }) => {}
+            result => {
+                result
+                    .and_then(|response| check_response(response).map_err(Into::into))
+                    .expect("served and decoded");
+            }
+        }
     });
 });
