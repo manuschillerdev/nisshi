@@ -36,27 +36,11 @@ use url::Url;
 
 static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| Runtime::new().expect("tokio runtime"));
 
-// `nisshi-storage-dynostore`'s `create_topic` runs `for _ in 0..topic.num_partitions { .. }`
-// with no upper bound check, so an unclamped `i32::MAX` here would hang a fuzz run rather
-// than exercise new logic; clamping keeps every execution fast while still covering the
-// interesting boundaries (negative, zero, the `-1` "default" sentinel, and "many").
-const MIN_PARTITIONS: i32 = -3;
-const MAX_PARTITIONS: i32 = 256;
-const MIN_REPLICATION: i16 = -3;
-const MAX_REPLICATION: i16 = 16;
-
+// `partitions` and `replication_factor` are deliberately left unclamped: `CreateTopicsService`
+// rejects out of range values (`INVALID_PARTITIONS`, `INVALID_REPLICATION_FACTOR`) and a request
+// totalling more than 10,000 partitions (`POLICY_VIOLATION`) before storage is consulted, so
+// an arbitrary `i32::MAX` cannot reach `create_topic`. Fuzzing the raw values checks that guard.
 fuzz_target!(|request: CreateTopicsRequest| {
-    let mut request = request;
-
-    if let Some(topics) = request.topics.as_mut() {
-        for topic in topics.iter_mut() {
-            topic.num_partitions = topic.num_partitions.clamp(MIN_PARTITIONS, MAX_PARTITIONS);
-            topic.replication_factor = topic
-                .replication_factor
-                .clamp(MIN_REPLICATION, MAX_REPLICATION);
-        }
-    }
-
     RUNTIME.block_on(async {
         check_request(request.clone()).expect("encode/decode request");
 
