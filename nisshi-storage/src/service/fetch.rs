@@ -606,7 +606,7 @@ where
                             .error_code(Some(ErrorCode::InvalidRequest.into()))
                             .session_id(Some(0))
                             .node_endpoints(Some([].into()))
-                            .responses(None));
+                            .responses(Some([].into())));
                     }
                 };
 

@@ -4045,6 +4045,7 @@ dependencies = [
  "bytes",
  "libfuzzer-sys",
  "nisshi-sans-io",
+ "nisshi-service",
  "nisshi-storage",
  "nisshi-storage-dynostore",
  "rama",
