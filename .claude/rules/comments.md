@@ -137,6 +137,9 @@ Prefer expressing a real coupling in something that *breaks* when it drifts — 
 A doc comment (a language's own doc-comment convention — Rust's `///`, a Python docstring, a Markdown page's lead paragraph) is orientation for the next reader, not reference documentation:
 
 - One-line summary for anything whose name is not self-evident. Skip it entirely when the signature or heading already says everything.
+- **Make the summary explain the name.** A reader reads the name first, then the summary, so the summary uses the name's own words and says what each word means here. Define a word in the name that the reader can't know, and name the parameter or value that the item sets. If the summary needs other words to say what the item does, rename the item instead.
+  - No: `/// Returns tools for the same broker whose clients fail within a fixed time when the broker doesn't answer.` above `fn with_client_timeouts(&self, timeout: Duration)`. The summary never says "client timeouts", and the reader can't tell which broker "the same broker" is.
+  - Yes: ``/// Returns a copy of this `KafkaCli` with its client timeouts set to `timeout`. A client timeout limits how long a tool's Kafka client waits for the broker.``
 - Longer form only when there is a real invariant, unit, or failure mode to state — see "Function-Header Scope vs. Inline Detail" above for where the line falls.
 - **No boilerplate that restates the signature with no new information.** "Returns a `Result`" adds nothing the signature doesn't already show. Rust's `# Errors` and `# Panics` sections are the right place for the load-bearing facts a signature can't carry — *which* condition produces *which* error variant, or under what non-obvious condition the function panics — but only when they say that, not just that errors or panics are possible (Rust API Guidelines [C-FAILURE](https://rust-lang.github.io/api-guidelines/documentation.html#c-failure)).
 
