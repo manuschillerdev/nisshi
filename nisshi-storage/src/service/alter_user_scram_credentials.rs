@@ -62,7 +62,7 @@ where
                             AlterUserScramCredentialsResult::default()
                                 .user(deletion.name.clone())
                                 .error_code(ErrorCode::UnsupportedSaslMechanism.into())
-                                .error_message(Some("".into())),
+                                .error_message(Some("Unknown SCRAM mechanism".into())),
                         );
 
                         continue;
@@ -106,7 +106,7 @@ where
                             AlterUserScramCredentialsResult::default()
                                 .user(upsertion.name.clone())
                                 .error_code(ErrorCode::UnsupportedSaslMechanism.into())
-                                .error_message(Some("".into())),
+                                .error_message(Some("Unknown SCRAM mechanism".into())),
                         );
 
                         continue;

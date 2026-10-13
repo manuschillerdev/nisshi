@@ -16,7 +16,7 @@ use bytes::Bytes;
 use nisshi_broker::Result;
 use nisshi_sans_io::{
     AlterUserScramCredentialsRequest, ErrorCode, RequestInput, ScramMechanism,
-    alter_user_scram_credentials_request::ScramCredentialUpsertion,
+    alter_user_scram_credentials_request::{ScramCredentialDeletion, ScramCredentialUpsertion},
 };
 use nisshi_storage::{AlterUserScramCredentialsService, ArcDynStorage, Storage};
 use rama::{Service, extensions::Extensions};
@@ -87,6 +87,63 @@ async fn bad_and_good_mechanism(storage: ArcDynStorage, persists: bool) -> Resul
     Ok(())
 }
 
+/// A deletion with an unrecognized mechanism is answered `UNSUPPORTED_SASL_MECHANISM`, with
+/// Kafka's message, on that item alone: the valid deletion beside it is still answered.
+async fn bad_and_good_deletion(storage: ArcDynStorage) -> Result<()> {
+    let bad = alphanumeric_string(15);
+    let good = alphanumeric_string(15);
+
+    let service = AlterUserScramCredentialsService {
+        storage: storage.clone(),
+    };
+
+    _ = service
+        .serve(RequestInput {
+            request: AlterUserScramCredentialsRequest::default()
+                .deletions(Some([].into()))
+                .upsertions(Some([upsertion(&good, SCRAM_SHA_256)].into())),
+            extensions: Extensions::default(),
+        })
+        .await?;
+
+    let response = service
+        .serve(RequestInput {
+            request: AlterUserScramCredentialsRequest::default()
+                .upsertions(Some([].into()))
+                .deletions(Some(
+                    [
+                        ScramCredentialDeletion::default()
+                            .name(bad.clone())
+                            .mechanism(UNKNOWN_MECHANISM),
+                        ScramCredentialDeletion::default()
+                            .name(good.clone())
+                            .mechanism(SCRAM_SHA_256),
+                    ]
+                    .into(),
+                )),
+            extensions: Extensions::default(),
+        })
+        .await?;
+
+    let results = response.results.as_deref().unwrap_or_default();
+    assert_eq!(2, results.len());
+
+    assert_eq!(bad, results[0].user);
+    assert_eq!(
+        ErrorCode::UnsupportedSaslMechanism,
+        ErrorCode::try_from(results[0].error_code)?
+    );
+    assert_eq!(
+        Some("Unknown SCRAM mechanism"),
+        results[0].error_message.as_deref()
+    );
+
+    assert_eq!(good, results[1].user);
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(results[1].error_code)?);
+
+    Ok(())
+}
+
 macro_rules! backend {
     ($name:ident, $feature:literal, $storage:path, $persists:literal) => {
         #[cfg(feature = $feature)]
@@ -100,6 +157,15 @@ macro_rules! backend {
                 let storage = $storage(Uuid::now_v7(), rng().random_range(0..i32::MAX)).await?;
 
                 super::bad_and_good_mechanism(storage, $persists).await
+            }
+
+            #[tokio::test]
+            async fn bad_and_good_deletion() -> Result<()> {
+                let _guard = init_tracing()?;
+
+                let storage = $storage(Uuid::now_v7(), rng().random_range(0..i32::MAX)).await?;
+
+                super::bad_and_good_deletion(storage).await
             }
         }
     };

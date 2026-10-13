@@ -19,8 +19,8 @@ use nisshi_sans_io::{
     create_topics_request::CreatableTopic, create_topics_response::CreatableTopicResult,
     topic::is_valid_topic_name,
 };
-use rama::{Layer, Service};
-use tracing::{debug, instrument};
+use rama::{Layer, Service, extensions::Extensions};
+use tracing::{debug, instrument, warn};
 
 use crate::{Error, Result};
 
@@ -102,6 +102,10 @@ pub(super) enum ValidatedTopic {
 pub struct ValidatedCreateTopicsRequest {
     pub(super) validate_only: bool,
     pub(super) topics: Vec<ValidatedTopic>,
+    /// The request's extensions, carried so a service behind the layer sees the same
+    /// per-connection state (e.g. the authenticated principal) as one without it.
+    #[allow(dead_code)]
+    pub(super) extensions: Extensions,
 }
 
 /// A [`CreateTopicsRequest`] rejected as a whole: its topics add up to more partitions than a
@@ -161,6 +165,7 @@ impl TryFrom<CreateTopicsRequest> for ValidatedCreateTopicsRequest {
         Ok(Self {
             validate_only: request.validate_only.unwrap_or_default(),
             topics: requested.into_iter().map(validate_topic).collect(),
+            extensions: Extensions::default(),
         })
     }
 }
@@ -173,7 +178,8 @@ impl TryFrom<CreateTopicsRequest> for ValidatedCreateTopicsRequest {
 fn validate_topic(mut topic: CreatableTopic) -> ValidatedTopic {
     let name = topic.name.clone();
 
-    let explicit_counts = topic.num_partitions != -1 || topic.replication_factor != -1;
+    let explicit_partitions = topic.num_partitions != -1;
+    let explicit_replication_factor = topic.replication_factor != -1;
 
     let num_partitions = Some(match topic.num_partitions {
         -1 => {
@@ -207,8 +213,34 @@ fn validate_topic(mut topic: CreatableTopic) -> ValidatedTopic {
     // Manual assignments fix the partitions and replicas, so the counts must be left at
     // `-1`. Storage creates `num_partitions` partitions, so an explicit count beside an
     // assignment would also bypass the partition cap, which counts the assignments instead.
-    if topic.assignments.as_deref().is_some_and(|a| !a.is_empty()) && explicit_counts {
-        return reject(ErrorCode::InvalidRequest);
+    // The replication factor is checked first, with the messages Kafka's KRaft controller
+    // sends, so the client is told which field to fix.
+    if topic.assignments.as_deref().is_some_and(|a| !a.is_empty()) {
+        let message = if explicit_replication_factor {
+            Some(
+                "A manual partition assignment was specified, but replication factor was not set to -1.",
+            )
+        } else if explicit_partitions {
+            Some(
+                "A manual partition assignment was specified, but numPartitions was not set to -1.",
+            )
+        } else {
+            None
+        };
+
+        if let Some(message) = message {
+            warn!(topic = %name, message, "rejecting topic, answering INVALID_REQUEST");
+
+            return ValidatedTopic::Rejected(
+                error_result(
+                    name.clone(),
+                    num_partitions,
+                    replication_factor,
+                    ErrorCode::InvalidRequest,
+                )
+                .error_message(Some(message.into())),
+            );
+        }
     }
 
     // Replication factor is checked before partition count, matching Kafka's KRaft
@@ -268,8 +300,20 @@ where
 
     #[instrument(skip(self, input))]
     async fn serve(&self, input: I) -> Result<Self::Output> {
-        match ValidatedCreateTopicsRequest::try_from(input.into().request) {
-            Ok(request) => self.inner.serve(request).await,
+        let RequestInput {
+            request,
+            extensions,
+        } = input.into();
+
+        match ValidatedCreateTopicsRequest::try_from(request) {
+            Ok(request) => {
+                self.inner
+                    .serve(ValidatedCreateTopicsRequest {
+                        extensions,
+                        ..request
+                    })
+                    .await
+            }
 
             Err(malformed) => {
                 debug!(
@@ -383,6 +427,15 @@ mod tests {
                 ErrorCode::try_from(result.error_code).expect("error code"),
                 "{num_partitions}/{replication_factor}"
             );
+
+            // Kafka checks the replication factor first, so its message wins when both are set.
+            let expected = if replication_factor != -1 {
+                "A manual partition assignment was specified, but replication factor was not set to -1."
+            } else {
+                "A manual partition assignment was specified, but numPartitions was not set to -1."
+            };
+
+            assert_eq!(Some(expected), result.error_message.as_deref());
         }
     }
 

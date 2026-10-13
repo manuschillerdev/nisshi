@@ -42,6 +42,11 @@ const MAXIMUM_TAGGED_FIELDS: usize = 128;
 /// reallocations as the vec grows one `push` at a time.
 const MAXIMUM_PREALLOCATED_TAG_DATA: usize = 4096;
 
+/// Up-front capacity for a tag field's data, given the length claimed on the wire.
+fn preallocated_capacity(claimed_length: usize) -> usize {
+    claimed_length.min(MAXIMUM_PREALLOCATED_TAG_DATA)
+}
+
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TagField(pub u32, pub Vec<u8>);
 
@@ -128,7 +133,7 @@ impl<'de> Deserialize<'de> for TagField {
 
                 (0..length)
                     .try_fold(
-                        Vec::with_capacity(length.min(MAXIMUM_PREALLOCATED_TAG_DATA)),
+                        Vec::with_capacity(preallocated_capacity(length)),
                         |mut acc, _| {
                             seq.next_element::<u8>()?
                                 .ok_or_else(|| serde::de::Error::custom("byte"))
@@ -476,6 +481,22 @@ mod tests {
         assert_eq!(expected, Example::deserialize(&mut decoder)?);
 
         Ok(())
+    }
+
+    /// Unlike a decode, which an overcommitting OS lets succeed even for a ~3.5GB
+    /// `Vec::with_capacity`, this fails if the cap is lost.
+    #[test]
+    fn preallocation_ignores_the_claimed_length_beyond_the_cap() {
+        assert_eq!(0, preallocated_capacity(0));
+        assert_eq!(10, preallocated_capacity(10));
+        assert_eq!(
+            MAXIMUM_PREALLOCATED_TAG_DATA,
+            preallocated_capacity(MAXIMUM_PREALLOCATED_TAG_DATA + 1)
+        );
+        assert_eq!(
+            MAXIMUM_PREALLOCATED_TAG_DATA,
+            preallocated_capacity(usize::MAX)
+        );
     }
 
     /// The up-front allocation for a tag field's data is capped at

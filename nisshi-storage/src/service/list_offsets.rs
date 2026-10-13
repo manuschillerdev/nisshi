@@ -115,8 +115,11 @@ where
 
         // `isolation_level` applies to the whole request, and the wire response has no
         // top-level error code (only per-partition ones), so an out of range value is
-        // reported by marking every requested partition `INVALID_REQUEST`, mirroring how
-        // real Kafka brokers surface whole-request validation failures on this API.
+        // reported by marking every requested partition `INVALID_REQUEST`.
+        //
+        // This deliberately differs from Kafka, whose `IsolationLevel.forId` throws
+        // `IllegalArgumentException` for an unknown id, so the client only sees
+        // `UNKNOWN_SERVER_ERROR`. `INVALID_REQUEST` tells it what it got wrong.
         let isolation_level = match input.request.isolation_level.map_or(
             Ok(IsolationLevel::ReadUncommitted),
             IsolationLevel::try_from,
@@ -172,7 +175,7 @@ where
                             Ok(offset) => offsets.push((tp, offset)),
 
                             Err(error) => {
-                                warn!(
+                                debug!(
                                     ?error,
                                     ?tp,
                                     timestamp = partition.timestamp,
@@ -190,6 +193,16 @@ where
                         }
                     }
                 }
+            }
+
+            // One line per request, not per partition, so a large request of bad timestamps
+            // can't flood the log; each entry is at `debug!` above.
+            if let Some((tp, _)) = invalid_timestamps.first() {
+                warn!(
+                    count = invalid_timestamps.len(),
+                    first = ?tp,
+                    "invalid timestamps, answering INVALID_TIMESTAMP"
+                );
             }
 
             let mut offsets = self

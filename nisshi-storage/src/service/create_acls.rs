@@ -56,7 +56,7 @@ where
                     .map(|_| {
                         AclCreationResult::default()
                             .error_code(ErrorCode::SecurityDisabled.into())
-                            .error_message(Some(ErrorCode::SecurityDisabled.to_string()))
+                            .error_message(Some("No Authorizer is configured.".into()))
                     })
                     .collect(),
             )))

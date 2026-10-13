@@ -20,7 +20,7 @@ use std::{
 use nisshi_sans_io::{
     ErrorCode, FetchRequest, FetchResponse, IsolationLevel, RequestInput, fetch_request::FetchTopic,
 };
-use rama::{Layer, Service};
+use rama::{Layer, Service, extensions::Extensions};
 use tracing::{instrument, warn};
 
 use super::topic_error_response;
@@ -39,6 +39,10 @@ pub struct ValidatedFetchRequest {
     pub(super) min_bytes: u32,
     pub(super) max_bytes: u32,
     pub(super) topics: Vec<FetchTopic>,
+    /// The request's extensions, carried so a service behind the layer sees the same
+    /// per-connection state (e.g. the authenticated principal) as one without it.
+    #[allow(dead_code)]
+    pub(super) extensions: Extensions,
 }
 
 /// The topics of a [`FetchRequest`] that failed to convert into a [`ValidatedFetchRequest`].
@@ -83,6 +87,7 @@ impl TryFrom<FetchRequest> for ValidatedFetchRequest {
                 min_bytes: 0,
                 max_bytes: 0,
                 topics: vec![],
+                extensions: Extensions::default(),
             });
         };
 
@@ -129,6 +134,7 @@ impl TryFrom<FetchRequest> for ValidatedFetchRequest {
             min_bytes,
             max_bytes,
             topics,
+            extensions: Extensions::default(),
         })
     }
 }
@@ -175,8 +181,20 @@ where
 
     #[instrument(skip(self, input))]
     async fn serve(&self, input: I) -> Result<Self::Output> {
-        match ValidatedFetchRequest::try_from(input.into().request) {
-            Ok(request) => self.inner.serve(request).await,
+        let RequestInput {
+            request,
+            extensions,
+        } = input.into();
+
+        match ValidatedFetchRequest::try_from(request) {
+            Ok(request) => {
+                self.inner
+                    .serve(ValidatedFetchRequest {
+                        extensions,
+                        ..request
+                    })
+                    .await
+            }
 
             Err(malformed) => {
                 warn!(
