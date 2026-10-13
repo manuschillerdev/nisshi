@@ -34,3 +34,5 @@ tmp
 /benchmark/openmessaging/.omb/
 /benchmark/openmessaging/results/
 /benchmark/openmessaging/broker.*
+/benchmark/openmessaging/.pg/
+/benchmark/openmessaging/run-*.log

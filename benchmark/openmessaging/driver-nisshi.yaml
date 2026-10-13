@@ -8,7 +8,7 @@ replicationFactor: 1
 topicConfig: |
 
 commonConfig: |
-  bootstrap.servers=host.docker.internal:9092
+  bootstrap.servers=localhost:9092
   default.api.timeout.ms=1200000
   request.timeout.ms=1200000
 
