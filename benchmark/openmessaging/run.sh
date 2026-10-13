@@ -37,14 +37,27 @@ pg_bin=${PG_BIN:-/opt/homebrew/opt/postgresql@18/bin}
 pg_dir="$here/.pg"
 pg_port=${POSTGRES_PORT:-5432}
 
+# The upstream commit that the patch and the build flags below were made for. Set OMB_COMMIT to
+# try another.
+omb_commit=${OMB_COMMIT:-5b1fa70951a323da26bd587174b58bb2c65b0b5c}
+
 # Upstream pins a Lombok that cannot compile on a current JDK, so the build overrides it. Its
 # Benchmark.main returns without System.exit, and KafkaTopicCreator's non-daemon
 # ScheduledExecutorService is never shut down, so the JVM would idle forever after the run.
-# Upstream also calls System.exit elsewhere, so the patch looks for the call after worker.close().
+# Upstream also calls System.exit elsewhere, so the patch looks for the call after worker.close(),
+# and the build stops when that call is not there afterwards, as it is when upstream has changed.
 build() {
-    [[ -d "$omb" ]] || git clone --depth 1 https://github.com/openmessaging/benchmark "$omb"
-    perl -0pi -e 's/^(        worker\.close\(\);\n)(?!        System\.exit\(0\);)/$1        System.exit(0);\n/m' \
-        "$omb/benchmark-framework/src/main/java/io/openmessaging/benchmark/Benchmark.java"
+    if [[ ! -d "$omb" ]]; then
+        git init -q "$omb"
+        git -C "$omb" fetch -q --depth 1 https://github.com/openmessaging/benchmark "$omb_commit"
+        git -C "$omb" checkout -q FETCH_HEAD
+    fi
+    local main_java="$omb/benchmark-framework/src/main/java/io/openmessaging/benchmark/Benchmark.java"
+    perl -0pi -e 's/^(        worker\.close\(\);\n)(?!        System\.exit\(0\);)/$1        System.exit(0);\n/m' "$main_java"
+    grep -A1 'worker\.close();' "$main_java" | grep -q 'System\.exit(0);' || {
+        echo "run.sh: could not make Benchmark.main exit, upstream has changed since $omb_commit" >&2
+        exit 1
+    }
     (cd "$omb" && mvn -q install -DskipTests -Dlombok.version=1.18.48 -Dspotless.check.skip=true \
         -Dlicense.skip=true -Dcheckstyle.skip=true -Dspotbugs.skip=true)
     rm -rf "$dist"
@@ -55,12 +68,15 @@ build() {
 # A dedicated postgres container, not the compose `db` service. It binds 5432, so stop any
 # other postgres or compose `db` holding that port first
 docker_postgres() {
+    local args=()
+    # shellcheck disable=SC2206 # POSTGRES_ARGS is a list of words, split on purpose
+    [[ -n ${POSTGRES_ARGS:-} ]] && args=(${POSTGRES_ARGS})
     docker rm -f nisshi-omb-postgres >/dev/null 2>&1 || true
-    docker run -d --name nisshi-omb-postgres -p "$pg_port:5432" \
+    docker run -d --name nisshi-omb-postgres -p "127.0.0.1:$pg_port:5432" \
         -e POSTGRES_PASSWORD=postgres -e PGUSER=postgres \
         -v "$root/etc/initdb.d:/docker-entrypoint-initdb.d:ro" \
         --health-cmd=pg_isready --health-interval=2s --health-retries=30 \
-        postgres:18 postgres ${POSTGRES_ARGS:-} >/dev/null
+        postgres:18 postgres ${args[@]+"${args[@]}"} >/dev/null
     until [[ "$(docker inspect -f '{{.State.Health.Status}}' nisshi-omb-postgres)" == healthy ]]; do sleep 1; done
 }
 
@@ -148,19 +164,21 @@ seed() {
     psql "${args[@]}" <"$here/seed.sql"
 }
 
-# Reads from the given offset up to the high watermark, as a fetch does, with a 1 MiB limit
+# Reads from the given offset up to the high watermark, as a fetch does, with a 1 MiB limit and the
+# 10000 row limit and plan settings of the broker (ROWS_PER_FETCH and FETCH_PLAN_SETTINGS in pg.rs)
 explain() {
-    local topic=${1:-seed} partition=${2:-0} offset=${3:-0} file query high key cluster
+    local topic=${1:-seed} partition=${2:-0} offset=${3:-0} file query high cluster binds
     cluster=$(psql -At -c "select c.name from cluster c join topic t on t.cluster = c.id where t.name = '$topic'")
     high=$(psql -At -c "select w.high from watermark w join topition tp on tp.id = w.topition join topic t on t.id = tp.topic where t.name = '$topic' and tp.partition = $partition")
     for file in record_fetch record_fetch_keyed; do
         echo "== $file, topic $topic partition $partition offsets $offset..$high"
         # prepared statements take their parameters from \bind, so drop the comments and final ;
         query=$(grep -v '^--' "$root/nisshi-storage-sql/src/pg/$file.sql" | sed 's/;[[:space:]]*$//')
-        # only the keyed query takes the key, as $7
-        if [[ $file == record_fetch_keyed ]]; then key=key-1; else key=; fi
-        printf 'explain (analyze, buffers) %s\n\\bind %s %s %s %s 1048576 %s %s \\g\n' \
-            "$query" "$cluster" "$topic" "$partition" "$offset" "$high" "$key" | psql
+        binds="$cluster $topic $partition $offset 1048576 $high"
+        # the keyed query takes the key as $7, then the row limit as $8
+        if [[ $file == record_fetch_keyed ]]; then binds="$binds key-1 10000"; else binds="$binds 10000"; fi
+        printf 'set enable_bitmapscan = off;\nset enable_seqscan = off;\nexplain (analyze, buffers) %s\n\\bind %s \\g\n' \
+            "$query" "$binds" | psql
     done
 }
 

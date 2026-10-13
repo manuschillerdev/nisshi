@@ -32,4 +32,5 @@ topic is an ordinary topic, so a consumer pointed at the broker can read it end 
 
 - `driver-nisshi.yaml` is upstream's Kafka driver with `replicationFactor: 1` (nisshi is single node).
 - The broker advertises `localhost:9092`, which is also the driver's bootstrap address.
+- The build checks out upstream commit `5b1fa70951a323da26bd587174b58bb2c65b0b5c` (`OMB_COMMIT` overrides it) and stops with an error if its `Benchmark.main` no longer matches the patch.
 - The build overrides upstream's Lombok version, which cannot compile on a current JDK, and makes the JVM exit after a run, which upstream's `Benchmark.main` does not.
