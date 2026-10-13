@@ -115,6 +115,9 @@ fmt:
 fmt-fix:
     cargo fmt --all
 
+shellcheck:
+    git ls-files -z '*.sh' '*.bash' | xargs -0 --no-run-if-empty shellcheck
+
 miri:
     cargo +nightly miri test --no-fail-fast --all-features
 
