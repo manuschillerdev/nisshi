@@ -6931,6 +6931,162 @@ mod tests {
         Ok(())
     }
 
+    /// Gives the topic a delete policy with a retention of one minute.
+    async fn retain_for_one_minute(storage: &Postgres, topition: &Topition) -> Result<()> {
+        let c = storage.connection().await?;
+
+        _ = c
+            .execute(
+                "insert into topic_configuration (topic, name, value) \
+                 select t.id, v.name, v.value \
+                 from topic t \
+                 join cluster c on c.id = t.cluster, \
+                 (values ('cleanup.policy', 'delete'), ('retention.ms', '60000')) v(name, value) \
+                 where c.name = $1 and t.name = $2",
+                &[&storage.cluster, &topition.topic()],
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    /// Produces one record per timestamp, in milliseconds since the epoch, at consecutive offsets.
+    async fn produce_at(storage: &Postgres, topition: &Topition, timestamps: &[i64]) -> Result<()> {
+        let base = timestamps.iter().copied().min().unwrap_or_default();
+
+        let batch = timestamps
+            .iter()
+            .enumerate()
+            .fold(Batch::builder(), |builder, (offset, timestamp)| {
+                builder.record(
+                    Record::builder()
+                        .value(Bytes::from_static(b"a").into())
+                        .offset_delta(i32::try_from(offset).unwrap_or(i32::MAX))
+                        .timestamp_delta(timestamp - base),
+                )
+            })
+            .base_timestamp(base)
+            .max_timestamp(timestamps.iter().copied().max().unwrap_or_default())
+            .last_offset_delta(i32::try_from(timestamps.len() - 1)?)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage.produce(None, topition, batch).await?;
+
+        Ok(())
+    }
+
+    /// The offsets that are still stored for the partition, in order.
+    async fn stored_offsets(storage: &Postgres, topition: &Topition) -> Result<Vec<i64>> {
+        let c = storage.connection().await?;
+
+        c.query(
+            "select r.offset_id \
+             from record r \
+             join topition tp on tp.id = r.topition \
+             join topic t on t.id = tp.topic \
+             join cluster c on c.id = t.cluster \
+             where c.name = $1 and t.name = $2 and tp.partition = $3 \
+             order by r.offset_id",
+            &[&storage.cluster, &topition.topic(), &topition.partition()],
+        )
+        .await?
+        .iter()
+        .map(|row| row.try_get::<_, i64>(0).map_err(Into::into))
+        .collect()
+    }
+
+    fn now_ms() -> Result<i64> {
+        Ok(i64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)?
+                .as_millis(),
+        )?)
+    }
+
+    /// Retention deletes the records below an offset that a search over the primary key finds,
+    /// in place of testing every record. When timestamps rise with offsets, that must delete
+    /// every expired record and no other.
+    #[tokio::test]
+    async fn retention_deletes_every_expired_record_when_timestamps_rise_with_offsets() -> Result<()>
+    {
+        const EXPIRED: i64 = 1_200;
+        const RECORDS: i64 = 2_000;
+
+        let Some((storage, topition)) = storage_with_topic().await? else {
+            return Ok(());
+        };
+
+        retain_for_one_minute(&storage, &topition).await?;
+
+        let now = now_ms()?;
+
+        let timestamps = (0..RECORDS)
+            .map(|offset| {
+                if offset < EXPIRED {
+                    now - 600_000 + offset
+                } else {
+                    now - 10_000 + (offset - EXPIRED)
+                }
+            })
+            .collect::<Vec<_>>();
+
+        produce_at(&storage, &topition, &timestamps).await?;
+
+        let deleted = storage.policy_delete(SystemTime::now()).await?;
+
+        assert_eq!(u64::try_from(EXPIRED)?, deleted);
+        assert_eq!(
+            (EXPIRED..RECORDS).collect::<Vec<_>>(),
+            stored_offsets(&storage, &topition).await?
+        );
+
+        Ok(())
+    }
+
+    /// A record whose timestamp is ahead of the records around it is not expired when they are,
+    /// and retention must keep it. The search can stop short of the expired records after it, and
+    /// those wait for a later sweep.
+    #[tokio::test]
+    async fn retention_keeps_a_record_that_has_not_expired_among_expired_ones() -> Result<()> {
+        const RECORDS: i64 = 1_000;
+        const AHEAD: [i64; 2] = [100, 500];
+
+        let Some((storage, topition)) = storage_with_topic().await? else {
+            return Ok(());
+        };
+
+        retain_for_one_minute(&storage, &topition).await?;
+
+        let now = now_ms()?;
+
+        let timestamps = (0..RECORDS)
+            .map(|offset| {
+                if AHEAD.contains(&offset) {
+                    now - 10_000
+                } else {
+                    now - 600_000 + offset
+                }
+            })
+            .collect::<Vec<_>>();
+
+        produce_at(&storage, &topition, &timestamps).await?;
+
+        _ = storage.policy_delete(SystemTime::now()).await?;
+
+        let stored = stored_offsets(&storage, &topition).await?;
+
+        for offset in AHEAD {
+            assert!(
+                stored.contains(&offset),
+                "offset {offset} has not expired and must be kept, stored: {stored:?}"
+            );
+        }
+
+        Ok(())
+    }
+
     /// Headers are read for the whole range of a fetch at once, and each must end up on the
     /// record at its own offset: records without headers stay without, and a record keeps its
     /// headers in produce order.
