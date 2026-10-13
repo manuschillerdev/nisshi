@@ -87,7 +87,7 @@ select format($q$
     select %1$s, o, 0, -1, -1,
         now() - (%2$s - o) * interval '1 millisecond',
         case when o %% 100 < %3$s then convert_to('key-' || (o %% 1000), 'UTF-8') end,
-        (select v from pool where i = (o * 7919 + %1$s) %% 256)
+        (select v from pool where i = (o::bigint * 7919 + %1$s) %% 256)
     from generate_series(0, %2$s - 1) o
 $q$, tp.id, :rows, :key_pct) as stmt
 from topition tp join topic t on t.id = tp.topic join cluster c on c.id = t.cluster
