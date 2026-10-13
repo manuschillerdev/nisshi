@@ -13,14 +13,22 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
+-- The headers of the records that a fetch returns, in one query. The offsets are those of the
+-- returned records, so the cost follows the response: a keyed fetch returns a sparse set of
+-- offsets from a wide range, and the headers of the records in between are not read.
+--
+-- As in record_fetch.sql, the topition id comes from a scalar subquery and not from a join: a join
+-- hides from the planner that the rows come out in offset order, and it sorts them, which for the
+-- headers of 10000 records spills to a temp file.
 select h.offset_id, h.k, h.v
 from header h
-join topition tp on tp.id = h.topition
-join topic t on tp.topic = t.id
-join cluster c on t.cluster = c.id
-where c.name = $1
-and t.name = $2
-and tp.partition = $3
-and h.offset_id >= $4
-and h.offset_id <= $5
+where h.topition = (
+    select tp.id
+    from cluster c
+    join topic t on t.cluster = c.id
+    join topition tp on tp.topic = t.id
+    where c.name = $1
+    and t.name = $2
+    and tp.partition = $3)
+and h.offset_id = any($4)
 order by h.offset_id, h.ordinal;

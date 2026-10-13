@@ -13,8 +13,8 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
--- prepare record_fetch_keyed (text, text, integer, integer, integer, integer, bytea) as
--- A fetch reads at most 10000 rows past the fetch offset. The running byte total below is
+-- prepare record_fetch_keyed (text, text, integer, integer, integer, integer, bytea, bigint) as
+-- A fetch reads at most $8 rows past the fetch offset (ROWS_PER_FETCH in pg.rs, 10000). The running byte total below is
 -- computed over every row that this query reads, so without the limit, one fetch costs as much
 -- as the whole backlog between the fetch offset and the high watermark, however few rows the
 -- client can take. The fetch service reads again from the last offset that it received, so a
@@ -24,6 +24,10 @@
 -- between the two hides from the planner that the rows come out in offset order, and it then sorts
 -- all of them, which for 10000 rows of 1 KiB spills to a temp file. Without the join, the limit
 -- stops an ordered walk of the primary key, and the running byte total reads that order as it is.
+--
+-- The fetch runs with the settings in FETCH_PLAN_SETTINGS (pg.rs), which turn off bitmap and
+-- sequential scans, so that this query keeps the ordered scan that the limit relies on. Run it
+-- with them to see the plan that a fetch uses: `run.sh explain` does.
 with candidates as (
 select
 
@@ -54,7 +58,7 @@ and r.offset_id < $6
 and r.k = convert_to($7, 'UTF-8')
 
 order by r.offset_id
-limit 10000),
+limit $8),
 
 sized as (
 select

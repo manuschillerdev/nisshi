@@ -17,14 +17,22 @@
 -- timestamp, so a query that tests every record for expiry reads the whole table: on 48 million
 -- records, one sweep took 81 seconds when nothing had expired.
 --
--- Timestamps rise with offsets in a partition, so the expired records are the ones below an
--- offset that a binary search over the primary key finds, with about 20 index probes in place of
--- a scan. A probe looks at the first record at or after the middle of the search range.
+-- The time that a record was appended (created_at) rises with its offset in a partition, so the
+-- records that have expired by that time are the ones below an offset that a binary search over
+-- the primary key finds, with about 20 index probes in place of a scan. A probe looks at the first
+-- record at or after the middle of the search range, and skips offsets that are no longer stored.
+-- The search uses the append time and not the record's own timestamp, because the timestamp is
+-- chosen by the producer: one record with a timestamp far in the future, from a skewed clock, would
+-- otherwise stop the search and hold back the deletion of every record after it.
 --
--- The delete still tests each record below that offset, so it never removes a record that has not
--- expired. A record with a timestamp ahead of the records after it stops the search from passing
--- it, which holds back the deletion of the records after it until it expires. This is how the
--- newest timestamp of a segment holds back that segment's deletion in Kafka.
+-- The delete still tests the timestamp of each record below that offset, so it never removes a
+-- record that has not expired, and a record with a timestamp ahead of its neighbours only keeps
+-- itself. A record with an old timestamp that was appended recently is deleted once its append time
+-- has expired, which can be later than its timestamp alone would allow. Appends that overlap in time
+-- can leave a record just below the boundary out of order, and it is deleted by a later sweep.
+--
+-- created_at is a timestamp without a time zone, in the time zone of the session that appended
+-- the record, so it is converted with the TimeZone setting before it is compared with now.
 with recursive
 
 deletion as (
@@ -44,6 +52,11 @@ deletion as (
     and tc.value like '%delete%'
 ),
 
+-- Each step narrows lo..hi, where lo is the first offset that may be kept and hi the first offset
+-- that is known to be kept. An expired probe moves lo past it. A probe that is not expired moves hi
+-- down to it. When no record is stored from the middle up to hi, which is the case when
+-- retention or compaction has already removed those offsets, hi moves down to the middle: each
+-- branch shrinks the range, so the search ends.
 search as (
     select topition, retention_secs, low as lo, high as hi
     from deletion
@@ -59,7 +72,8 @@ search as (
     left join lateral (
         select
         r.offset_id,
-        (extract(epoch from cast($2 as timestamp)) - extract(epoch from r.timestamp)) > s.retention_secs as expired
+        (extract(epoch from cast($2 as timestamp))
+            - extract(epoch from r.created_at at time zone current_setting('TimeZone'))) > s.retention_secs as expired
         from record r
         where r.topition = s.topition
         and r.offset_id >= (s.lo + s.hi) / 2
