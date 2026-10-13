@@ -171,6 +171,17 @@ impl Builder<String, i32, Url, Pool> {
 /// full-table scans can legitimately run longer than a request-path query should.
 const DEFAULT_STATEMENT_TIMEOUT_MS: u64 = 30_000;
 
+/// Settings that leave an ordered scan of the `record` primary key as the only plan for a
+/// fetch. The fetch queries read at most 10000 rows because the limit stops that scan. When
+/// the planner estimates that the offset range holds few rows, it instead reads the whole range
+/// with a bitmap scan and sorts it before the limit applies. `record` grows by tens of
+/// megabytes a second and is analyzed after the fact, so the estimate is often wrong, and one
+/// fetch then reads and sorts every record between its offset and the high watermark. A prepared
+/// statement keeps such a plan after it is built, so the plan can outlive the stale statistics
+/// that produced it.
+const FETCH_PLAN_SETTINGS: &str =
+    "SET LOCAL enable_bitmapscan = off; SET LOCAL enable_seqscan = off";
+
 /// How long a caller waits for a free pooled connection before failing fast with a retriable
 /// error, rather than queuing indefinitely while the pool is exhausted.
 const DEFAULT_POOL_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -2314,6 +2325,10 @@ impl Storage for Postgres {
 
         let mut c = self.connection().await?;
         let tx = c.transaction().await?;
+
+        tx.batch_execute(FETCH_PLAN_SETTINGS)
+            .await
+            .inspect_err(|err| error!(?err))?;
 
         let records = if let Some(key) = key_filter {
             self.tx_prepare_query(
