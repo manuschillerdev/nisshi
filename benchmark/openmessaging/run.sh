@@ -3,7 +3,9 @@
 # nisshi broker backed by postgres. Java and Maven run in docker, so neither is needed on the host.
 #
 #   run.sh build              clone and build the benchmark image
-#   run.sh broker             start postgres (docker, port 5432) and the nisshi broker
+#   run.sh broker             start postgres (docker, port 5432) and the nisshi broker.
+#                             POSTGRES_ARGS adds arguments to the postgres server, for example
+#                             "-c shared_preload_libraries=auto_explain"
 #   run.sh run [workload]     run a workload (default: workloads/smoke.yaml, relative to
 #                             benchmark/openmessaging/, or a /benchmark/workloads/... path)
 #   run.sh seed [var=value]   fill postgres with generated records, see seed.sql for the variables
@@ -32,7 +34,7 @@ broker() {
         -e POSTGRES_PASSWORD=postgres -e PGUSER=postgres \
         -v "$root/etc/initdb.d:/docker-entrypoint-initdb.d:ro" \
         --health-cmd=pg_isready --health-interval=2s --health-retries=30 \
-        postgres:18 >/dev/null
+        postgres:18 postgres ${POSTGRES_ARGS:-} >/dev/null
     until [[ "$(docker inspect -f '{{.State.Health.Status}}' nisshi-omb-postgres)" == healthy ]]; do sleep 1; done
     cargo build --release --bin nisshi --no-default-features --features postgres
     pkill -f 'target/release/nisshi broker' 2>/dev/null || true
@@ -72,7 +74,8 @@ seed() {
 
 # Reads from the given offset up to the high watermark, as a fetch does, with a 1 MiB limit
 explain() {
-    local topic=${1:-seed} partition=${2:-0} offset=${3:-0} file query high key
+    local topic=${1:-seed} partition=${2:-0} offset=${3:-0} file query high key cluster
+    cluster=$(psql -At -c "select c.name from cluster c join topic t on t.cluster = c.id where t.name = '$topic'")
     high=$(psql -At -c "select w.high from watermark w join topition tp on tp.id = w.topition join topic t on t.id = tp.topic where t.name = '$topic' and tp.partition = $partition")
     for file in record_fetch record_fetch_keyed; do
         echo "== $file, topic $topic partition $partition offsets $offset..$high"
@@ -80,8 +83,8 @@ explain() {
         query=$(grep -v '^--' "$root/nisshi-storage-sql/src/pg/$file.sql" | sed 's/;[[:space:]]*$//')
         # only the keyed query takes the key, as $7
         if [[ $file == record_fetch_keyed ]]; then key=key-1; else key=; fi
-        printf 'explain (analyze, buffers) %s\n\\bind nisshi_cluster %s %s %s 1048576 %s %s \\g\n' \
-            "$query" "$topic" "$partition" "$offset" "$high" "$key" | psql
+        printf 'explain (analyze, buffers) %s\n\\bind %s %s %s %s 1048576 %s %s \\g\n' \
+            "$query" "$cluster" "$topic" "$partition" "$offset" "$high" "$key" | psql
     done
 }
 
