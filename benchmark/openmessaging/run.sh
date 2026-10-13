@@ -6,6 +6,9 @@
 #   run.sh broker             start postgres (docker, port 5432) and the nisshi broker
 #   run.sh run [workload]     run a workload (default: workloads/smoke.yaml, relative to
 #                             benchmark/openmessaging/, or a /benchmark/workloads/... path)
+#   run.sh seed [var=value]   fill postgres with generated records, see seed.sql for the variables
+#   run.sh explain [topic [partition [offset]]]
+#                             EXPLAIN ANALYZE the fetch queries against the seeded topic
 #   run.sh stop               stop the broker and postgres
 set -euo pipefail
 
@@ -48,12 +51,38 @@ run() {
     [[ "$workload" == /* ]] || workload="/nisshi/$workload"
     mkdir -p "$results"
     # bin/benchmark resolves its classpath relative to /benchmark and writes result JSON to the
-    # working directory, so run there and move the results out afterwards. HEAP_OPTS defaults to
-    # 4G, more than Docker Desktop's VM may have free.
+    # working directory, so run there and move the results out afterwards. HEAP_OPTS keeps
+    # the JVM within what Docker Desktop's VM has free.
     docker run --rm \
         -e "HEAP_OPTS=${HEAP_OPTS:--Xms512m -Xmx1g}" \
         -v "$here:/nisshi:ro" -v "$results:/results" -w /benchmark \
         "$image" bash -c "bin/benchmark --drivers /nisshi/driver-nisshi.yaml $workload; mv -f *.json /results/ 2>/dev/null || true"
+}
+
+psql() {
+    docker exec -i nisshi-omb-postgres psql -U postgres -X -q "$@"
+}
+
+# Generates records straight into postgres, which is far faster than producing through the broker
+seed() {
+    local args=() var
+    for var in "$@"; do args+=(-v "$var"); done
+    psql "${args[@]}" <"$here/seed.sql"
+}
+
+# Reads from the given offset up to the high watermark, as a fetch does, with a 1 MiB limit
+explain() {
+    local topic=${1:-seed} partition=${2:-0} offset=${3:-0} file query high key
+    high=$(psql -At -c "select w.high from watermark w join topition tp on tp.id = w.topition join topic t on t.id = tp.topic where t.name = '$topic' and tp.partition = $partition")
+    for file in record_fetch record_fetch_keyed; do
+        echo "== $file, topic $topic partition $partition offsets $offset..$high"
+        # prepared statements take their parameters from \bind, so drop the comments and final ;
+        query=$(grep -v '^--' "$root/nisshi-storage-sql/src/pg/$file.sql" | sed 's/;[[:space:]]*$//')
+        # only the keyed query takes the key, as $7
+        if [[ $file == record_fetch_keyed ]]; then key=key-1; else key=; fi
+        printf 'explain (analyze, buffers) %s\n\\bind nisshi_cluster %s %s %s 1048576 %s %s \\g\n' \
+            "$query" "$topic" "$partition" "$offset" "$high" "$key" | psql
+    done
 }
 
 stop() {
@@ -66,6 +95,8 @@ case "${1:-}" in
     build) build ;;
     broker) broker ;;
     run) shift; run "$@" ;;
+    seed) shift; seed "$@" ;;
+    explain) shift; explain "$@" ;;
     stop) stop ;;
-    *) sed -n '2,10p' "$0"; exit 1 ;;
+    *) sed -n '2,14p' "$0"; exit 1 ;;
 esac
