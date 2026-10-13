@@ -20,9 +20,10 @@
 -- client can take. The fetch service reads again from the last offset that it received, so a
 -- limit that ends a read early costs one more query.
 --
--- The limit is inside a lateral join because a limit on the outer join does not stop the
--- planner from reading and sorting every row in the range: it chooses a bitmap scan over the
--- primary key, and the lateral form makes it walk the key in order and stop at the limit.
+-- The record table is read directly, with the topition id looked up in a scalar subquery. A join
+-- between the two hides from the planner that the rows come out in offset order, and it then sorts
+-- all of them, which for 10000 rows of 1 KiB spills to a temp file. Without the join, the limit
+-- stops an ordered walk of the primary key, and the running byte total reads that order as it is.
 with candidates as (
 select
 
@@ -36,30 +37,23 @@ r.producer_epoch
 
 from
 
-cluster c
-join topic t on t.cluster = c.id
-join topition tp on tp.topic = t.id
-cross join lateral (
-    select
-        r.offset_id,
-        r.attributes,
-        r.timestamp,
-        r.k,
-        r.v,
-        r.producer_id,
-        r.producer_epoch
-    from record r
-    where r.topition = tp.id
-    and r.offset_id >= $4
-    and r.offset_id < $6
-    order by r.offset_id
-    limit 10000) r
+record r
 
 where
 
-c.name = $1
-and t.name = $2
-and tp.partition = $3),
+r.topition = (
+    select tp.id
+    from cluster c
+    join topic t on t.cluster = c.id
+    join topition tp on tp.topic = t.id
+    where c.name = $1
+    and t.name = $2
+    and tp.partition = $3)
+and r.offset_id >= $4
+and r.offset_id < $6
+
+order by r.offset_id
+limit 10000),
 
 sized as (
 select
