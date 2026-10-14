@@ -368,6 +368,11 @@ impl Engine {
     /// `policy_delete` prefix pruning. Does NOT touch
     /// `latest_indexed_timestamp`: Kafka's active segment is likewise
     /// unaffected by deleting older segments.
+    ///
+    /// This reads through `tx`, because a migration in the same write
+    /// (`Self::backfill_time_index`) has replaced the index in `tx`. A scan
+    /// of the committed index would delete a rebuilt entry whose key an old
+    /// entry below `low` shares.
     async fn prune_time_index_below(
         &self,
         tx: &slatedb::DbTransaction,
@@ -376,14 +381,9 @@ impl Engine {
         low: i64,
     ) -> Result<()> {
         let prefix = postcard::to_stdvec(&TimeIndexKeyPrefix::new(topic, partition))?;
-        let scan_start = postcard::to_stdvec(&TimeIndexKey::scan_from(topic, partition, 0))?;
 
-        let mut scan = self.db.scan(scan_start..).await?;
+        let mut scan = tx.scan_prefix(&prefix, ..).await?;
         while let Some(kv) = scan.next().await? {
-            if !kv.key.starts_with(&prefix) {
-                break;
-            }
-
             let base_offset: i64 = postcard::from_bytes(&kv.value)?;
             if base_offset >= low {
                 break;
@@ -1903,8 +1903,6 @@ impl Storage for Engine {
 
             let response = match list_offset {
                 ListOffset::Earliest => {
-                    // The log start offset is the low watermark, advanced by
-                    // delete_records; timestamps below it are pruned there.
                     let offset = watermark.low.unwrap_or(0);
                     let timestamp = self
                         .timestamp_at_offset(metadata.id, topition.partition, offset)
