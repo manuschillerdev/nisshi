@@ -1126,14 +1126,15 @@ impl Storage for Engine {
                                 partition.partition_index,
                             ))?;
 
-                            let mut watermark =
-                                tx.get(&watermark_key).await.map_err(Error::from).and_then(
-                                    |watermark| {
-                                        watermark.map_or(Ok(Watermark::default()), |encoded| {
-                                            postcard::from_bytes(&encoded[..]).map_err(Into::into)
-                                        })
-                                    },
-                                )?;
+                            // Decoded without the legacy migration: the cutoff needs only
+                            // `low` and `high`, and the migration runs below, after the
+                            // batch deletions, so that the rebuilt index covers only the
+                            // surviving batches.
+                            let watermark =
+                                match tx.get(&watermark_key).await.map_err(Error::from)? {
+                                    Some(encoded) => Self::decode_watermark(&encoded)?.0,
+                                    None => Watermark::default(),
+                                };
 
                             let high_watermark = watermark.high.unwrap_or(0);
                             let log_start = watermark.low.unwrap_or(0);
@@ -1198,6 +1199,14 @@ impl Storage for Engine {
                                             }
                                         }
                                     }
+
+                                    let mut watermark = self
+                                        .partition_watermark(
+                                            &tx,
+                                            metadata.id,
+                                            partition.partition_index,
+                                        )
+                                        .await?;
 
                                     watermark.low = Some(cutoff);
 
