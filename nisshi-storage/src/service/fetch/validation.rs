@@ -103,6 +103,8 @@ impl TryFrom<FetchRequest> for ValidatedFetchRequest {
                 topics: topics.clone(),
             })?;
 
+        // Stricter than Kafka, which treats a negative `max_wait_ms` as "respond
+        // now" (ReplicaManager.scala). No real client sends one.
         let max_wait = u64::try_from(request.max_wait_ms)
             .map(Duration::from_millis)
             .map_err(|_| MalformedFetchRequest {
