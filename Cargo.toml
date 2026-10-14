@@ -77,7 +77,7 @@ private_intra_doc_links = "deny"
 [workspace.dependencies]
 anyhow = "1.0.94"
 apache-avro = "0.21.0"
-arrow = { version = "58" }
+arrow = { version = "60" }
 async-trait = "0.1.86"
 backoff = {version = "0.4.0", features = ["tokio"]}
 bytes = { version = "1", features = ["serde"] }
@@ -89,7 +89,7 @@ console = "0.16.2"
 convert_case = "0.12.0"
 crc-fast = "1.8.0"
 criterion = { version = "0.8.2", features = ["async_tokio", "html_reports"] }
-datafusion = "53"
+datafusion = "55"
 deadpool = "0.13.1"
 deadpool-postgres = "0.14.2"
 # Pinned: buoyant_kernel 0.22.2 depends on "^1", which resolves to 1.2.0
@@ -135,7 +135,7 @@ opentelemetry-stdout = "0.33.0"
 opentelemetry_sdk = { version = "0.33.0", features = ["testing"] }
 ordered-float = "5.1"
 owo-colors = {version = "4.2.3", features = ["supports-colors"]}
-parquet = {version = "58", features = ["async"]}
+parquet = {version = "59", features = ["async"]}
 pbkdf2 = "0.12.2"
 percent-encoding = "2.3.2"
 pkcs8 = { version = "0.10", default-features = false, features = ["encryption", "pem", "std", "3des"] }
