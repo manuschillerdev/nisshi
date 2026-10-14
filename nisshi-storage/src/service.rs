@@ -94,7 +94,7 @@ use opentelemetry::{
     KeyValue,
     metrics::{Counter, Gauge, Histogram},
 };
-pub use produce::ProduceService;
+pub use produce::{ProduceService, inflate_produced};
 use rama::{Layer, Service};
 use tokio::sync::{
     mpsc::{self, error::SendError},

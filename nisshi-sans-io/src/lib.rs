@@ -116,6 +116,7 @@
 //! and whether any tagged fields can be present for a particular message version. Serializers
 //! map from the [Serde Data Model](https://serde.rs/data-model.html) to the Kafka protocol or vice versa.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 pub mod acl;
 #[cfg(feature = "arbitrary")]
 mod arbitrary_support;
@@ -2251,6 +2252,7 @@ impl From<ConfigSource> for i8 {
 }
 
 /// The configuration operation type.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OpType {
     Set,
     Delete,
