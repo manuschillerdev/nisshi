@@ -1,0 +1,15 @@
+{
+  "name": "nisshi-cloudflare-websocket-consumer",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "check": "wrangler types && tsc --noEmit",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "typescript": "^6.0.0",
+    "wrangler": "^4.0.0"
+  }
+}

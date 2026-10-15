@@ -185,6 +185,7 @@ pub struct Broker<G, S> {
     advertised_listener: Url,
     storage: S,
     groups: G,
+    websocket_push: Option<crate::websocket_push::Config>,
 
     sasl_config: Option<Arc<SASLConfig>>,
     tls_server_config: Option<Arc<ServerConfig>>,
@@ -222,6 +223,7 @@ where
             advertised_listener,
             storage,
             groups,
+            websocket_push: None,
 
             sasl_config: None,
             tls_server_config: None,
@@ -239,6 +241,11 @@ where
 
     pub fn builder() -> PhantomBuilder {
         Builder::default()
+    }
+
+    pub fn websocket_push(mut self, configuration: Option<crate::websocket_push::Config>) -> Self {
+        self.websocket_push = configuration;
+        self
     }
 
     pub async fn main(mut self, started: Instant) -> Result<ErrorCode> {
@@ -366,7 +373,26 @@ where
 
     pub async fn serve(&mut self, started: Instant) -> Result<()> {
         self.register().await?;
-        self.listen(started).await
+        let mut deliveries = JoinSet::new();
+        if let Some(configuration) = &self.websocket_push {
+            configuration.spawn(
+                &mut deliveries,
+                self.storage.clone(),
+                self.cancellation.clone(),
+            );
+        }
+        let listener = self.listen(started);
+        tokio::pin!(listener);
+        tokio::select! {
+            result = &mut listener => result,
+            result = deliveries.join_next(), if !deliveries.is_empty() => {
+                match result {
+                    Some(Err(error)) => Err(error.into()),
+                    _ if self.cancellation.is_cancelled() => listener.await,
+                    _ => Err(Error::Message("websocket delivery task exited unexpectedly".into())),
+                }
+            },
+        }
     }
 
     pub async fn register(&mut self) -> Result<()> {
@@ -962,6 +988,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             advertised_listener: self.advertised_listener,
             storage,
             groups,
+            websocket_push: None,
             sasl_config,
             tls_server_config: self.tls_server_config.map(Arc::new),
 

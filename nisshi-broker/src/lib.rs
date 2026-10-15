@@ -40,6 +40,7 @@ pub mod broker;
 pub mod coordinator;
 pub mod otel;
 pub mod service;
+pub mod websocket_push;
 
 #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum CancelKind {

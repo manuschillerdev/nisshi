@@ -1,0 +1,13 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "nisshi-websocket-consumer",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-15",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  "durable_objects": {
+    "bindings": [{ "name": "CONSUMERS", "class_name": "Consumer" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Consumer"] }],
+  "secrets": { "required": ["PUSH_TOKEN"] }
+}

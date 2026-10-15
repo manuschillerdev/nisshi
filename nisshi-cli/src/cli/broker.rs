@@ -113,6 +113,10 @@ pub(super) struct Arg {
     #[arg(long, requires = "key")]
     key_passphrase_file: Option<PathBuf>,
 
+    /// JSON configuration for broker-initiated WebSocket delivery subscriptions
+    #[arg(long, env = "NISSHI_WEBSOCKET_PUSH_CONFIG")]
+    websocket_push_config: Option<PathBuf>,
+
     /// Silent
     #[arg(long)]
     silent: bool,
@@ -398,6 +402,12 @@ impl Arg {
             _ => return Err(Error::TlsRequiresCertAndKey),
         };
 
+        let websocket_push = self
+            .websocket_push_config
+            .as_deref()
+            .map(nisshi_broker::websocket_push::Config::load)
+            .transpose()?;
+
         let cluster_id = self.cluster_id;
         let incarnation_id = Uuid::now_v7();
         let otlp_endpoint_url = self
@@ -544,7 +554,11 @@ impl Arg {
             }
         }
 
-        broker.build().await.map_err(Into::into)
+        broker
+            .build()
+            .await
+            .map(|broker| broker.websocket_push(websocket_push))
+            .map_err(Into::into)
     }
 }
 
