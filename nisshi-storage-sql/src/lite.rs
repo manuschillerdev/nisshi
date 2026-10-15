@@ -85,6 +85,7 @@ use url::Url;
 use uuid::Uuid;
 
 pub mod factory;
+mod transactions;
 
 macro_rules! include_sql {
     ($e: expr) => {
@@ -775,6 +776,46 @@ impl Delegate {
 
         let attributes = BatchAttribute::try_from(inflated.attributes)?;
 
+        if attributes.transaction && !attributes.control {
+            let transaction_id = transaction_id.ok_or(Error::Api(ErrorCode::InvalidTxnState))?;
+            if self
+                .transaction_status(
+                    connection,
+                    transaction_id,
+                    inflated.producer_id,
+                    inflated.producer_epoch,
+                )
+                .await?
+                != Some(TxnState::Begin)
+            {
+                return Err(Error::Api(ErrorCode::InvalidTxnState));
+            }
+            let mut enrolled = connection
+                .connection
+                .query(
+                    "select 1 from txn_topition txn_tp
+                 join txn_detail d on d.id = txn_tp.txn_detail
+                 join txn on txn.id = d.\"transaction\"
+                 join producer_epoch pe on pe.id = d.producer_epoch
+                 join topition tp on tp.id = txn_tp.topition
+                 join topic t on t.id = tp.topic join cluster c on c.id = t.cluster
+                 where c.name = ?1 and txn.name = ?2 and pe.producer = ?3 and pe.epoch = ?4
+                 and t.name = ?5 and tp.partition = ?6",
+                    (
+                        self.cluster.as_str(),
+                        transaction_id,
+                        inflated.producer_id,
+                        inflated.producer_epoch,
+                        topic,
+                        partition,
+                    ),
+                )
+                .await?;
+            if enrolled.next().await?.is_none() {
+                return Err(Error::Api(ErrorCode::InvalidTxnState));
+            }
+        }
+
         debug!(after_attributes = elapsed_millis(start));
 
         if !attributes.control
@@ -979,6 +1020,37 @@ impl Delegate {
     ) -> Result<ErrorCode> {
         debug!(cluster = ?self.cluster, ?transaction_id, ?producer_id, ?producer_epoch, ?committed);
 
+        let status = match self
+            .transaction_status(connection, transaction_id, producer_id, producer_epoch)
+            .await
+        {
+            Ok(status) => status,
+            Err(Error::Api(error)) => return Ok(error),
+            Err(error) => return Err(error),
+        };
+        let write_marker = match status {
+            Some(TxnState::Committed) => {
+                return Ok(if committed {
+                    ErrorCode::None
+                } else {
+                    ErrorCode::InvalidTxnState
+                });
+            }
+            Some(TxnState::Aborted) => {
+                return Ok(if committed {
+                    ErrorCode::InvalidTxnState
+                } else {
+                    ErrorCode::None
+                });
+            }
+            Some(TxnState::PrepareCommit) if committed => false,
+            Some(TxnState::PrepareAbort) if !committed => false,
+            Some(TxnState::PrepareCommit | TxnState::PrepareAbort) => {
+                return Ok(ErrorCode::InvalidTxnState);
+            }
+            None | Some(TxnState::Begin) => true,
+        };
+
         let mut overlaps = vec![];
 
         let mut rows = connection
@@ -1001,42 +1073,44 @@ impl Delegate {
 
             debug!(?topition);
 
-            let control_batch: Bytes = if committed {
-                ControlBatch::default().commit().try_into()?
-            } else {
-                ControlBatch::default().abort().try_into()?
-            };
-            let end_transaction_marker: Bytes = EndTransactionMarker::default().try_into()?;
+            if write_marker {
+                let control_batch: Bytes = if committed {
+                    ControlBatch::default().commit().try_into()?
+                } else {
+                    ControlBatch::default().abort().try_into()?
+                };
+                let end_transaction_marker: Bytes = EndTransactionMarker::default().try_into()?;
 
-            let batch = inflated::Batch::builder()
-                .record(
-                    Record::builder()
-                        .key(control_batch.into())
-                        .value(end_transaction_marker.into()),
-                )
-                .attributes(
-                    BatchAttribute::default()
-                        .control(true)
-                        .transaction(true)
-                        .into(),
-                )
-                .producer_id(producer_id)
-                .producer_epoch(producer_epoch)
-                .base_sequence(-1)
-                .build()
-                .and_then(TryInto::try_into)
-                .inspect(|deflated| debug!(?deflated))?;
+                let batch = inflated::Batch::builder()
+                    .record(
+                        Record::builder()
+                            .key(control_batch.into())
+                            .value(end_transaction_marker.into()),
+                    )
+                    .attributes(
+                        BatchAttribute::default()
+                            .control(true)
+                            .transaction(true)
+                            .into(),
+                    )
+                    .producer_id(producer_id)
+                    .producer_epoch(producer_epoch)
+                    .base_sequence(-1)
+                    .build()
+                    .and_then(TryInto::try_into)
+                    .inspect(|deflated| debug!(?deflated))?;
 
-            // A control batch holds one uncompressed record, so it is
-            // inflated inline. `inflate` would wait for a decode permit
-            // while this transaction holds the database write lock.
-            let inflated = inflated::Batch::try_from(&batch)?;
+                // A control batch holds one uncompressed record, so it is
+                // inflated inline. `inflate` would wait for a decode permit
+                // while this transaction holds the database write lock.
+                let inflated = inflated::Batch::try_from(&batch)?;
 
-            let offset = self
-                .produce_in_tx(Some(transaction_id), &topition, batch, inflated, connection)
-                .await?;
+                let offset = self
+                    .produce_in_tx(Some(transaction_id), &topition, batch, inflated, connection)
+                    .await?;
 
-            debug!(offset, ?topition);
+                debug!(offset, ?topition);
+            }
 
             let mut rows = connection
                 .query(
@@ -1102,6 +1176,10 @@ impl Delegate {
 
             for txn in txns {
                 debug!(?txn);
+
+                if txn.status == TxnState::PrepareAbort {
+                    self.record_abort(connection, &txn).await?;
+                }
 
                 _ = connection
                     .execute(
@@ -1653,6 +1731,10 @@ impl Engine {
 
 #[async_trait]
 impl Storage for Engine {
+    async fn supports_transactional_consumption(&self) -> Result<bool> {
+        self.inner.supports_transactional_consumption().await
+    }
+
     #[instrument(skip_all)]
     async fn register_broker(&self, broker_registration: BrokerRegistrationRequest) -> Result<()> {
         let start = SystemTime::now();
@@ -2314,6 +2396,7 @@ impl Builder<String, i32, Url, Url> {
                     .inspect(|rows| debug!(name, rows))
                     .inspect_err(|err| error!(name, ?err));
             }
+            transactions::initialize_history(&connection).await?;
         }
 
         match self
@@ -2442,6 +2525,10 @@ fn unique_constraint(error_code: ErrorCode) -> impl Fn(libsql::Error) -> Error {
 
 #[async_trait]
 impl Storage for Delegate {
+    async fn supports_transactional_consumption(&self) -> Result<bool> {
+        Ok(self.lake.is_none())
+    }
+
     async fn register_broker(&self, broker_registration: BrokerRegistrationRequest) -> Result<()> {
         let start = SystemTime::now();
 
@@ -2905,37 +2992,22 @@ impl Storage for Delegate {
 
         let c = self.connection().await?;
 
-        let mut records = if let Some(key) = key_filter {
-            let key_bytes = key.as_bytes().to_vec();
-            c.query(
-                "record_fetch_keyed.sql",
+        let mut records = c
+            .connection
+            .query(
+                include_str!("lite/record_fetch.sql"),
                 (
                     self.cluster.as_str(),
                     base_topic,
                     topition.partition(),
                     offset,
-                    (max_bytes as i64),
+                    i64::from(max_bytes),
                     high_watermark,
-                    key_bytes,
+                    key_filter.map(|key| key.as_bytes().to_vec()),
+                    isolation_level == IsolationLevel::ReadCommitted,
                 ),
             )
-            .await
-            .inspect_err(|err| error!(?err))?
-        } else {
-            c.query(
-                "record_fetch.sql",
-                (
-                    self.cluster.as_str(),
-                    topition.topic(),
-                    topition.partition(),
-                    offset,
-                    (max_bytes as i64),
-                    high_watermark,
-                ),
-            )
-            .await
-            .inspect_err(|err| error!(?err))?
-        };
+            .await?;
 
         let mut batches = vec![];
 
@@ -4402,9 +4474,18 @@ impl Storage for Delegate {
                         }
                     }
 
-                    if let Some(TxnState::Begin) = status {
+                    if matches!(
+                        status,
+                        Some(TxnState::Begin | TxnState::PrepareAbort | TxnState::PrepareCommit)
+                    ) {
                         let error = self
-                            .end_in_tx(transaction_id, id, epoch, false, &pc)
+                            .end_in_tx(
+                                transaction_id,
+                                id,
+                                epoch,
+                                status == Some(TxnState::PrepareCommit),
+                                &pc,
+                            )
                             .await?;
 
                         if error != ErrorCode::None {
@@ -4419,6 +4500,16 @@ impl Storage for Delegate {
                                     &[KeyValue::new("operation", "init_producer")],
                                 )
                             });
+                        }
+                        if self
+                            .transaction_status(&pc, transaction_id, id, epoch)
+                            .await?
+                            .is_some_and(|state| state.is_prepared())
+                        {
+                            pc.commit(tx).await?;
+                            return Ok(ProducerIdResponse::failed(
+                                ErrorCode::ConcurrentTransactions,
+                            ));
                         }
                     }
                 }
@@ -4630,6 +4721,34 @@ impl Storage for Delegate {
             transaction_id, producer_id, producer_epoch, group_id
         );
 
+        let pc = self.connection().await?;
+        let tx = pc.transaction().await?;
+        match self
+            .check_producer_epoch(&pc, producer_id, producer_epoch)
+            .await
+        {
+            Ok(()) => {}
+            Err(Error::Api(error)) => return Ok(error),
+            Err(error) => return Err(error),
+        }
+        let status = self
+            .transaction_status(&pc, transaction_id, producer_id, producer_epoch)
+            .await?;
+        if status.is_some_and(|state| state.is_prepared()) {
+            return Ok(ErrorCode::ConcurrentTransactions);
+        }
+        let _ = pc
+            .execute(
+                "txn_detail_update_started_at.sql",
+                (
+                    self.cluster.as_str(),
+                    transaction_id,
+                    producer_id,
+                    producer_epoch,
+                ),
+            )
+            .await?;
+        pc.commit(tx).await?;
         Ok(ErrorCode::None).inspect(|_| {
             DELEGATE_REQUEST_DURATION.record(
                 elapsed_millis(start),
@@ -4657,6 +4776,16 @@ impl Storage for Delegate {
 
                 let pc = self.connection().await?;
                 let tx = pc.transaction().await?;
+
+                self.check_producer_epoch(&pc, producer_id, producer_epoch)
+                    .await?;
+                if self
+                    .transaction_status(&pc, &transaction_id, producer_id, producer_epoch)
+                    .await?
+                    .is_some_and(|state| state.is_prepared())
+                {
+                    return Err(Error::Api(ErrorCode::ConcurrentTransactions));
+                }
 
                 let mut results = vec![];
 
@@ -4748,6 +4877,33 @@ impl Storage for Delegate {
 
         let pc = self.connection().await?;
         let tx = pc.transaction().await?;
+
+        self.check_producer_epoch(&pc, offsets.producer_id, offsets.producer_epoch)
+            .await?;
+        if self
+            .transaction_status(
+                &pc,
+                &offsets.transaction_id,
+                offsets.producer_id,
+                offsets.producer_epoch,
+            )
+            .await?
+            .is_some_and(|state| state != TxnState::Begin)
+        {
+            return Err(Error::Api(ErrorCode::InvalidTxnState));
+        }
+
+        let _ = pc
+            .execute(
+                "txn_detail_update_started_at.sql",
+                (
+                    self.cluster.as_str(),
+                    offsets.transaction_id.as_str(),
+                    offsets.producer_id,
+                    offsets.producer_epoch,
+                ),
+            )
+            .await?;
 
         let (producer_id, producer_epoch) = if let Some(row) = pc
             .query_opt(
@@ -4879,6 +5035,14 @@ impl Storage for Delegate {
         let pc = self.connection().await?;
         let tx = pc.transaction().await?;
 
+        match self
+            .check_producer_epoch(&pc, producer_id, producer_epoch)
+            .await
+        {
+            Ok(()) => {}
+            Err(Error::Api(error)) => return Ok(error),
+            Err(error) => return Err(error),
+        }
         let error_code = self
             .end_in_tx(transaction_id, producer_id, producer_epoch, committed, &pc)
             .await?;
@@ -4891,17 +5055,18 @@ impl Storage for Delegate {
         })
     }
 
-    async fn maintain_transactions(&self, _now: SystemTime) -> Result<()> {
-        Ok(())
+    async fn maintain_transactions(&self, now: SystemTime) -> Result<()> {
+        self.expire_transactions(now).await
     }
 
     async fn aborted_transactions(
         &self,
-        _topition: &Topition,
-        _offset: i64,
-        _last_stable_offset: i64,
+        topition: &Topition,
+        offset: i64,
+        last_stable_offset: i64,
     ) -> Result<Vec<AbortedTransaction>> {
-        Ok(vec![])
+        self.list_aborted_transactions(topition, offset, last_stable_offset)
+            .await
     }
 
     async fn maintain(&self, now: SystemTime) -> Result<()> {

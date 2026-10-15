@@ -93,6 +93,12 @@ hooks. Reports and raw broker/runtime logs are written to ignored `.e2e/` files;
 processes are stopped on completion. Override ports with `NISSHI_KAFKA_PORT` and
 `NISSHI_WORKER_PORT`, or the binary path with `NISSHI_BINARY`.
 
+To run the same test with persistent SQLite storage, build the broker with
+`--features dynostore,libsql` and run
+`NISSHI_STORAGE_ENGINE=sqlite:///broker.db npm run test:e2e`. The database lives
+in the test's temporary broker directory and is removed after the run. The
+default storage engine is `memory://`.
+
 This verifies [WebSocket hibernation](https://developers.cloudflare.com/durable-objects/best-practices/websockets/)
 in the pinned local workerd runtime: automatic idle eviction followed by wake-up
 on the same socket. It does not measure Cloudflare's production eviction timing

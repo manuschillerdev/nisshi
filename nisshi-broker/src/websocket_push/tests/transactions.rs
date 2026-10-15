@@ -5,6 +5,9 @@ use super::*;
 use nisshi_sans_io::add_partitions_to_txn_request::AddPartitionsToTxnTopic;
 use nisshi_storage::{ProducerIdResponse, TxnAddPartitionsRequest};
 
+#[cfg(feature = "libsql")]
+mod sqlite;
+
 fn transactional(endpoint: String) -> Subscription {
     let mut subscription = subscription(endpoint);
     subscription.transactional_id = Some("actor-transaction".into());

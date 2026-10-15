@@ -50,8 +50,9 @@ last stable offset, aborted records are filtered, and transaction markers are
 omitted. Filtering also applies when resuming inside an aborted batch or when a
 producer ID is reused by a later committed transaction. Startup rejects storage
 backends without committed transactional consumption support. Dynostore
-(`memory`, `s3`, `gs`) implements this capability. PostgreSQL, SQLite and other
-unverified backends fail closed; PostgreSQL's abort metadata is not implemented.
+(`memory`, `s3`, `gs`) and SQLite (`sqlite`, built with `libsql`) implement this
+capability. PostgreSQL and other unverified backends fail closed; PostgreSQL's
+abort metadata is not implemented.
 Dynostore with a lakehouse sink configured also fails closed: Kafka transactions
 cannot atomically publish an external lakehouse write. Aborted transaction history
 is retained until topic deletion, so repeated aborts can grow cluster metadata;
@@ -63,6 +64,14 @@ cluster for transactional consumption; there is no automatic historical migratio
 Upgraded Dynostore keeps authoritative group offsets and transaction decisions
 together in cluster metadata. Mixing old and new brokers, or downgrading after
 this migration, is unsupported.
+
+SQLite stores aborted ranges in its database and publishes output records,
+transaction decisions and consumed offsets in one database transaction. Abort
+history survives restart and reuse of a producer epoch. Its transaction
+maintenance sweep aborts timed-out work and fences the old producer. SQLite
+databases with transaction history predating abort tracking are rejected; use a
+fresh database for this proof of concept. SQLite with a lakehouse sink also fails
+closed. Keep the database and WAL on persistent storage across broker replacement.
 
 ## Delivery and acknowledgement
 

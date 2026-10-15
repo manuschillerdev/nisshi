@@ -18,6 +18,7 @@ const binary = resolve(example, process.env.NISSHI_BINARY ?? "../../target/debug
 const output = resolve(example, ".e2e");
 const kafkaPort = Number(process.env.NISSHI_KAFKA_PORT ?? 29092);
 const workerPort = Number(process.env.NISSHI_WORKER_PORT ?? 28787);
+const storageEngine = process.env.NISSHI_STORAGE_ENGINE ?? "memory://";
 const runId = randomUUID();
 const topic = `ws-e2e-${runId}`;
 const outputTopic = `ws-results-${runId}`;
@@ -30,7 +31,7 @@ versions.node = process.version;
 const sourceRevision = execFileSync("git", ["rev-parse", "HEAD"], { cwd: example, encoding: "utf8" }).trim();
 const sourceDirty = execFileSync("git", ["status", "--porcelain"], { cwd: example, encoding: "utf8" }).trim().length > 0;
 const sourceHashes = Object.fromEntries(["test/e2e.mjs", "test/consumer.ts", "src/index.ts"].map((path) => [path, createHash("sha256").update(readFileSync(join(example, path))).digest("hex")]));
-const report = { run_id: runId, scope: "local workerd automatic idle hibernation; no Cloudflare deployment", status: "running", source_revision: sourceRevision, source_dirty: sourceDirty, source_sha256: sourceHashes, versions, events };
+const report = { run_id: runId, scope: "local workerd automatic idle hibernation; no Cloudflare deployment", storage_engine: storageEngine, status: "running", source_revision: sourceRevision, source_dirty: sourceDirty, source_sha256: sourceHashes, versions, events };
 let runtime, broker, producer, transactionalProducer, outputConsumer, admin, brokerLog, temporary;
 const outputs = [];
 
@@ -116,7 +117,7 @@ try {
   const configuration = join(temporary, "subscriptions.json");
   writeFileSync(configuration, JSON.stringify({ subscriptions: [{ group_id: groupId, topic, partition: 0, endpoint: `ws://127.0.0.1:${workerPort}/consumer`, bearer_token_env: "NISSHI_E2E_TOKEN", transactional_id: `ws-output-${runId}`, output_topics: [outputTopic] }] }));
   brokerLog = openSync(join(output, "broker.log"), "w");
-  broker = spawn(binary, ["broker", "--silent", "--listener-url", `tcp://127.0.0.1:${kafkaPort}`, "--advertised-listener-url", `tcp://127.0.0.1:${kafkaPort}`, "--storage-engine", "memory://", "--websocket-push-config", configuration], {
+  broker = spawn(binary, ["broker", "--silent", "--listener-url", `tcp://127.0.0.1:${kafkaPort}`, "--advertised-listener-url", `tcp://127.0.0.1:${kafkaPort}`, "--storage-engine", storageEngine, "--websocket-push-config", configuration], {
     cwd: temporary, env: { PATH: process.env.PATH, HOME: process.env.HOME, RUST_LOG: "nisshi_broker=info", NISSHI_E2E_TOKEN: secret }, stdio: ["ignore", brokerLog, brokerLog],
   });
   broker.on("error", (error) => { report.broker_error = error.message; });
