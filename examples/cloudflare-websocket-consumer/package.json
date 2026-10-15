@@ -5,10 +5,14 @@
   "scripts": {
     "dev": "wrangler dev",
     "check": "wrangler types && tsc --noEmit",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "test:e2e": "node test/e2e.mjs"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",
+    "esbuild": "0.28.2",
+    "kafkajs": "2.2.4",
+    "miniflare": "5.20261012.0-beta",
     "typescript": "^6.0.0",
     "wrangler": "^4.0.0"
   }
