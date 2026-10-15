@@ -1460,6 +1460,13 @@ fn _assert_storage_factory_trait_object(_s: &dyn StorageFactory) {}
 /// The Core storage abstraction. All storage engines implement this type.
 #[async_trait]
 pub trait Storage: Debug + Send + Sync + 'static {
+    /// Whether committed reads include abort metadata and transaction completion
+    /// publishes produced records and consumed offsets atomically. Defaults to
+    /// false so consumers requiring these guarantees fail closed on other engines.
+    async fn supports_transactional_consumption(&self) -> Result<bool> {
+        Ok(false)
+    }
+
     /// On startup a broker will register with storage.
     async fn register_broker(&self, broker_registration: BrokerRegistrationRequest) -> Result<()>;
 
@@ -1679,8 +1686,8 @@ pub trait Storage: Debug + Send + Sync + 'static {
     async fn maintain_transactions(&self, _now: SystemTime) -> Result<()>;
 
     /// Aborted transactions overlapping `[offset, last_stable_offset)`, reporting which producer
-    /// ranges a `read_committed` Fetch client should discard. Postgres implements this; other
-    /// backends return `Ok(vec![])` or forward to an inner storage.
+    /// ranges a `read_committed` Fetch client should discard. Backends that do not retain
+    /// this history must not advertise `supports_transactional_consumption`.
     async fn aborted_transactions(
         &self,
         _topition: &Topition,
@@ -1706,6 +1713,10 @@ impl<T> Storage for Arc<T>
 where
     T: Storage + ?Sized,
 {
+    async fn supports_transactional_consumption(&self) -> Result<bool> {
+        self.as_ref().supports_transactional_consumption().await
+    }
+
     async fn register_broker(&self, broker_registration: BrokerRegistrationRequest) -> Result<()> {
         self.as_ref().register_broker(broker_registration).await
     }
@@ -1976,6 +1987,10 @@ impl<T> Storage for Box<T>
 where
     T: Storage + ?Sized,
 {
+    async fn supports_transactional_consumption(&self) -> Result<bool> {
+        self.as_ref().supports_transactional_consumption().await
+    }
+
     async fn register_broker(&self, broker_registration: BrokerRegistrationRequest) -> Result<()> {
         self.as_ref().register_broker(broker_registration).await
     }

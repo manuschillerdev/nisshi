@@ -338,6 +338,10 @@ impl<G> Storage for ProduceRequestBatcher<G>
 where
     G: Storage + Clone,
 {
+    async fn supports_transactional_consumption(&self) -> Result<bool> {
+        self.storage.supports_transactional_consumption().await
+    }
+
     async fn register_broker(&self, broker_registration: BrokerRegistrationRequest) -> Result<()> {
         self.storage.register_broker(broker_registration).await
     }

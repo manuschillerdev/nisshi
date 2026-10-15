@@ -108,6 +108,7 @@ use crate::{
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Request {
+    SupportsTransactionalConsumption,
     RegisterBroker(BrokerRegistrationRequest),
     IncrementalAlterResource(AlterConfigsResource),
     CreateTopic {
@@ -243,6 +244,9 @@ impl Display for Request {
             Self::OffsetStage(_) => f.write_str("OffsetStage"),
             Self::Produce { .. } => f.write_str("Produce"),
             Self::RegisterBroker(_) => f.write_str("RegisterBroker"),
+            Self::SupportsTransactionalConsumption => {
+                f.write_str("SupportsTransactionalConsumption")
+            }
             Self::TxnAddOffsets { .. } => f.write_str("TxnAddOffsets"),
             Self::TxnAddPartitions(_) => f.write_str("TxnAddPartitions"),
             Self::TxnEnd { .. } => f.write_str("TxnEnd"),
@@ -258,6 +262,7 @@ impl Display for Request {
 
 #[derive(Clone, Debug)]
 pub enum Response {
+    SupportsTransactionalConsumption(Result<bool>),
     AdvertisedListener(Result<Url>),
     Brokers(Result<Vec<DescribeClusterBroker>>),
     ClusterId(Result<String>),
@@ -494,6 +499,14 @@ macro_rules! serve_and_extract {
 
 #[async_trait]
 impl Storage for RequestChannelService {
+    async fn supports_transactional_consumption(&self) -> Result<bool> {
+        serve_and_extract!(
+            self,
+            Request::SupportsTransactionalConsumption,
+            SupportsTransactionalConsumption
+        )
+    }
+
     #[instrument(skip_all)]
     async fn register_broker(&self, broker_registration: BrokerRegistrationRequest) -> Result<()> {
         serve_and_extract!(
@@ -1135,6 +1148,11 @@ where
 
     async fn serve(&self, req: Request) -> Result<Self::Output, Self::Error> {
         match req {
+            Request::SupportsTransactionalConsumption => {
+                Ok(Response::SupportsTransactionalConsumption(
+                    self.storage.supports_transactional_consumption().await,
+                ))
+            }
             Request::RegisterBroker(broker_registration) => Ok(Response::RegisterBroker(
                 self.storage.register_broker(broker_registration).await,
             )),

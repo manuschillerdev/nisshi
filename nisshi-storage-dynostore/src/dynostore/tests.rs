@@ -30,6 +30,7 @@ mod latency;
 mod ping;
 mod post_write_failure_reason;
 mod stale_watermark;
+mod transactions;
 
 pub(crate) fn init_tracing() -> Result<DefaultGuard, Error> {
     _ = dotenv().ok();

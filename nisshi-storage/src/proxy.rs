@@ -86,6 +86,10 @@ impl<G> Storage for SemaphoreProxy<G>
 where
     G: Storage + Clone,
 {
+    async fn supports_transactional_consumption(&self) -> Result<bool> {
+        self.storage.supports_transactional_consumption().await
+    }
+
     async fn register_broker(&self, broker_registration: BrokerRegistrationRequest) -> Result<()> {
         let start = SystemTime::now();
         let _permit = self.semaphore.acquire().await.inspect(|_| {

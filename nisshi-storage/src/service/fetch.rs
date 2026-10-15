@@ -33,16 +33,13 @@ use crate::{Error, METER, OffsetStage, Result, Storage, Topition};
 /// `OFFSET_OUT_OF_RANGE`, once per Fetch) or `above_high_watermark`
 /// (answered with `NONE` and no records). The second does not end the wait
 /// for `max_wait`, so one Fetch counts once per poll round: its rate follows
-/// storage latency, not the number of parked consumers, and on dynostore
-/// with several brokers it also counts, for the life of a cached high
-/// watermark, consumers that are only ahead of a stale one.
+/// storage latency, not the number of parked consumers.
 static FETCH_OFFSET_OUT_OF_BOUNDS: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("nisshi_fetch_offset_out_of_bounds")
         .with_description(
             "Partition reads whose fetch offset is below the log start (once per Fetch) or above \
-             the high watermark (once per poll round: shows only whether parked fetches exist; \
-             a short burst on multi-broker dynostore is expected)",
+             the high watermark (once per poll round: shows only whether parked fetches exist)",
         )
         .build()
 });
@@ -419,11 +416,7 @@ where
         // records. Kafka does so only up to the log end offset, and answers
         // OFFSET_OUT_OF_RANGE above it:
         // https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/LocalLog.scala#L368-L371
-        // This is a deliberate difference. On dynostore, the high watermark
-        // that this broker reads can lag a write through another broker, so
-        // a client can be ahead of it, and an error would reset the client's
-        // position. One rule for every engine keeps the answer independent
-        // of the engine. The consequence: a consumer whose position is past
+        // Preserve the existing behavior across engines: a consumer past
         // the end of the log (after a restore, or a seek past the end) never
         // applies `auto.offset.reset`. It resumes at its position once the
         // log reaches it, and skips the records written below that position.
@@ -560,8 +553,40 @@ where
             }
         };
 
-        Ok(Self::partition_data(partition_index, offset_stage, batches))
-            .inspect(|r| debug!(?r, elapsed = ?started_at.elapsed()))
+        // Kafka clients filter aborted batches using this index. Returning
+        // transactional data without its abort metadata can execute work that
+        // never committed, so an unavailable index must withhold the records.
+        let aborted = if isolation == IsolationLevel::ReadCommitted
+            && batches.iter().any(|batch| batch.is_transactional())
+        {
+            let first = batches
+                .first()
+                .map_or(fetch_offset, |batch| batch.base_offset.min(fetch_offset));
+            match before(
+                partition_deadline(deadlines.read, left),
+                self.storage.aborted_transactions(&tp, first, offset),
+            )
+            .await
+            {
+                Ok(aborted) => aborted?,
+                Err(reason) => {
+                    missed(
+                        &tp,
+                        "aborted_transactions",
+                        fetch_offset,
+                        reason,
+                        started_at,
+                    );
+                    return Ok(Self::unknown_offsets(partition_index, ErrorCode::None));
+                }
+            }
+        } else {
+            vec![]
+        };
+
+        Ok(Self::partition_data(partition_index, offset_stage, batches)
+            .aborted_transactions(Some(aborted)))
+        .inspect(|r| debug!(?r, elapsed = ?started_at.elapsed()))
     }
 
     /// `offset_stage`, read before the records, raised to cover records
@@ -1236,15 +1261,6 @@ mod tests {
                     unimplemented!()
                 }
 
-                async fn aborted_transactions(
-                    &self,
-                    _topition: &Topition,
-                    _offset: i64,
-                    _last_stable_offset: i64,
-                ) -> Result<Vec<AbortedTransaction>> {
-                    unimplemented!()
-                }
-
                 async fn cluster_id(&self) -> Result<String> {
                     unimplemented!()
                 }
@@ -1304,6 +1320,9 @@ mod tests {
         offset_stage: OffsetStage,
         offset_stage_reads: Arc<AtomicUsize>,
         stage_growth: i64,
+        aborted: Result<Vec<AbortedTransaction>>,
+        abort_delay: Duration,
+        abort_reads: Arc<Mutex<Vec<(i64, i64)>>>,
     }
 
     impl Scripted {
@@ -1315,6 +1334,9 @@ mod tests {
                 offset_stage,
                 offset_stage_reads: Arc::new(AtomicUsize::new(0)),
                 stage_growth: 0,
+                aborted: Ok(vec![]),
+                abort_delay: Duration::ZERO,
+                abort_reads: Arc::new(Mutex::new(vec![])),
             }
         }
 
@@ -1332,6 +1354,17 @@ mod tests {
     }
 
     storage_double!(Scripted {
+        async fn aborted_transactions(
+            &self,
+            _topition: &Topition,
+            offset: i64,
+            last_stable_offset: i64,
+        ) -> Result<Vec<AbortedTransaction>> {
+            self.abort_reads.lock()?.push((offset, last_stable_offset));
+            tokio::time::sleep(self.abort_delay).await;
+            self.aborted.clone()
+        }
+
         async fn fetch(
             &self,
             _topition: &Topition,
@@ -1435,6 +1468,64 @@ mod tests {
                 .map(|frame| frame.batches)
                 .unwrap_or_default()
         })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn committed_fetch_includes_abort_history_for_partial_batch() -> Result<()> {
+        let mut records = batch(10, &[0, 1, 2])?;
+        records.attributes = nisshi_sans_io::BatchAttribute::default()
+            .transaction(true)
+            .into();
+        let mut storage = Scripted::new(vec![vec![records], vec![]], OFFSET_STAGE);
+        let aborted = vec![
+            AbortedTransaction::default()
+                .producer_id(7)
+                .first_offset(10),
+        ];
+        storage.aborted = Ok(aborted.clone());
+        let reads = storage.abort_reads.clone();
+        let response = fetch_partition_at(
+            storage,
+            Duration::from_secs(1),
+            1_000_000,
+            IsolationLevel::ReadCommitted,
+            11,
+        )
+        .await?;
+        assert_eq!(Some(aborted), response.aborted_transactions);
+        assert!(response.records.is_some());
+        assert_eq!(&[(10, 13)], reads.lock()?.as_slice());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unavailable_abort_history_never_returns_transactional_records() -> Result<()> {
+        for stalled in [false, true] {
+            let mut records = batch(10, &[0])?;
+            records.attributes = nisshi_sans_io::BatchAttribute::default()
+                .transaction(true)
+                .into();
+            let mut storage = Scripted::new(vec![vec![records], vec![]], OFFSET_STAGE);
+            if stalled {
+                storage.abort_delay = Duration::from_secs(60);
+            } else {
+                storage.aborted = Err(Error::Api(ErrorCode::UnknownServerError));
+            }
+            let response = fetch_partition_at(
+                storage,
+                Duration::from_secs(1),
+                1_000_000,
+                IsolationLevel::ReadCommitted,
+                10,
+            )
+            .await;
+            if stalled {
+                assert!(response?.records.is_none());
+            } else {
+                assert!(response.is_err());
+            }
+        }
+        Ok(())
     }
 
     /// Engines that rebuild batches from rows stop assembling at the
@@ -1919,6 +2010,15 @@ mod tests {
     }
 
     storage_double!(Partitions {
+        async fn aborted_transactions(
+            &self,
+            _topition: &Topition,
+            _offset: i64,
+            _last_stable_offset: i64,
+        ) -> Result<Vec<AbortedTransaction>> {
+            unimplemented!()
+        }
+
         async fn fetch(
             &self,
             topition: &Topition,

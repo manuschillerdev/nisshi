@@ -86,6 +86,7 @@ use uuid::Uuid;
 
 mod metadata;
 mod opticon;
+mod transactions;
 
 #[cfg(test)]
 mod tests;
@@ -199,11 +200,31 @@ type ProducerId = i64;
 type Sequence = i32;
 type Topic = String;
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 struct Meta {
     producers: BTreeMap<ProducerId, ProducerDetail>,
     topics: BTreeMap<Topic, TopicMetadata>,
     transactions: BTreeMap<String, Txn>,
+    // Transaction decisions and consumed offsets share one conditional object write.
+    #[serde(default)]
+    committed_offsets: BTreeMap<Group, BTreeMap<Topic, BTreeMap<Partition, OffsetCommitRequest>>>,
+    #[serde(default)]
+    aborted: BTreeMap<Topic, BTreeMap<Partition, Vec<AbortedRange>>>,
+    #[serde(default)]
+    transaction_history_complete: bool,
+}
+
+impl Default for Meta {
+    fn default() -> Self {
+        Self {
+            producers: BTreeMap::new(),
+            topics: BTreeMap::new(),
+            transactions: BTreeMap::new(),
+            committed_offsets: BTreeMap::new(),
+            aborted: BTreeMap::new(),
+            transaction_history_complete: true,
+        }
+    }
 }
 
 impl OptiCon<Meta> {
@@ -213,91 +234,6 @@ impl OptiCon<Meta> {
 }
 
 impl Meta {
-    fn produced(
-        &self,
-        transaction_id: &str,
-        producer_id: ProducerId,
-        producer_epoch: ProducerEpoch,
-    ) -> Result<BTreeMap<Topition, TxnProduceOffset>> {
-        let Some(txn) = self.transactions.get(transaction_id) else {
-            return Err(Error::Api(ErrorCode::TransactionalIdNotFound));
-        };
-
-        if txn.producer != producer_id {
-            return Err(Error::Api(ErrorCode::UnknownProducerId));
-        }
-
-        let Some(txn_detail) = txn.epochs.get(&producer_epoch) else {
-            return Err(Error::Api(ErrorCode::ProducerFenced));
-        };
-
-        let mut produced = BTreeMap::new();
-
-        for (topic, partitions) in txn_detail.produces.iter() {
-            for (partition, offset_range) in partitions.iter() {
-                let Some(offset_range) = offset_range else {
-                    continue;
-                };
-
-                let tp = Topition::new(topic.to_owned(), *partition);
-                assert_eq!(None, produced.insert(tp, *offset_range));
-            }
-        }
-
-        Ok(produced)
-    }
-
-    fn overlapping_transactions(
-        &self,
-        transaction_id: &str,
-        producer_id: ProducerId,
-        producer_epoch: ProducerEpoch,
-    ) -> Result<Vec<TxnId>> {
-        let candidates = self.produced(transaction_id, producer_id, producer_epoch)?;
-
-        let mut overlapping = Vec::new();
-
-        'candidates: for (candidate_id, txn) in self.transactions.iter() {
-            for (epoch, txn_detail) in txn.epochs.iter() {
-                if transaction_id == candidate_id
-                    && producer_id == txn.producer
-                    && producer_epoch == *epoch
-                {
-                    continue;
-                }
-
-                let Some(state) = txn_detail.state else {
-                    continue;
-                };
-
-                for (topic, partitions) in txn_detail.produces.iter() {
-                    for (partition, offset_range) in partitions.iter() {
-                        let Some(offset_range) = offset_range else {
-                            continue;
-                        };
-
-                        let tp = Topition::new(topic.to_owned(), *partition);
-
-                        if let Some(candidate) = candidates.get(&tp)
-                            && offset_range.offset_start < candidate.offset_end
-                        {
-                            overlapping.push(TxnId {
-                                transaction: candidate_id.to_owned(),
-                                producer_id: txn.producer,
-                                producer_epoch: *epoch,
-                                state,
-                            });
-
-                            continue 'candidates;
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(overlapping)
-    }
-
     fn alter_topic(&mut self, topic: &str, changes: &[AlterableConfig]) -> Result<()> {
         let metadata = self
             .topics
@@ -352,14 +288,6 @@ struct ProducerDetail {
     sequences: BTreeMap<ProducerEpoch, BTreeMap<String, BTreeMap<i32, Sequence>>>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-struct TxnId {
-    transaction: String,
-    producer_id: ProducerId,
-    producer_epoch: ProducerEpoch,
-    state: TxnState,
-}
-
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 struct Txn {
     producer: ProducerId,
@@ -369,10 +297,33 @@ struct Txn {
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 struct TxnDetail {
     transaction_timeout_ms: i32,
+    #[serde(default)]
+    attempt: Uuid,
     started_at: Option<SystemTime>,
     state: Option<TxnState>,
     produces: BTreeMap<Topic, BTreeMap<Partition, Option<TxnProduceOffset>>>,
     offsets: BTreeMap<Group, BTreeMap<Topic, BTreeMap<Partition, TxnCommitOffset>>>,
+    #[serde(default)]
+    appends: BTreeMap<Topic, BTreeMap<Partition, TxnAppend>>,
+    #[serde(default)]
+    markers: BTreeMap<Topic, BTreeMap<Partition, TxnAppend>>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+struct TxnAppend {
+    id: Uuid,
+    sequence: i32,
+    crc: u32,
+    last_offset_delta: i32,
+    offset: Option<i64>,
+    complete: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+struct AbortedRange {
+    producer_id: i64,
+    first_offset: i64,
+    last_offset: i64,
 }
 
 impl From<&TxnDetail> for BTreeMap<Topition, Offset> {
@@ -390,6 +341,17 @@ impl From<&TxnDetail> for BTreeMap<Topition, Offset> {
             }
         }
 
+        for (topic, partitions) in &value.appends {
+            for (partition, append) in partitions {
+                if !append.complete {
+                    let offset = append.offset.unwrap_or(0);
+                    _ = result
+                        .entry(Topition::new(topic, *partition))
+                        .and_modify(|start| *start = (*start).min(offset))
+                        .or_insert(offset);
+                }
+            }
+        }
         result
     }
 }
@@ -513,7 +475,7 @@ impl DynoStore {
         debug!(?topic);
 
         self.meta
-            .with(&self.object_store, |meta| {
+            .with_fresh(&self.object_store, |meta| {
                 Ok(match topic {
                     TopicId::Name(name) => meta.topics.get(name).cloned(),
                     TopicId::Id(id) => meta
@@ -1097,6 +1059,10 @@ impl Storage for DynoStore {
             self.meta
                 .with_mut(&self.object_store, |meta| {
                     _ = meta.topics.remove(metadata.topic.name.as_str());
+                    _ = meta.aborted.remove(metadata.topic.name.as_str());
+                    for topics in meta.committed_offsets.values_mut() {
+                        _ = topics.remove(metadata.topic.name.as_str());
+                    }
                     Ok(())
                 })
                 .await?;
@@ -1136,6 +1102,30 @@ impl Storage for DynoStore {
             .describe_config(topition.topic(), ConfigResource::Topic, None)
             .await
             .inspect_err(|err| debug!(?err))?;
+
+        let attributes = BatchAttribute::try_from(deflated.attributes)?;
+        if attributes.transaction {
+            let transaction_id = transaction_id.ok_or(Error::Api(ErrorCode::InvalidTxnState))?;
+            if self.lake.is_some() {
+                return Err(Error::Api(ErrorCode::InvalidTxnState));
+            }
+            if !attributes.control {
+                let batch = {
+                    let batch = deflated.clone();
+                    offload(move || inflate_produced(&batch))
+                }
+                .await?;
+                if let Some(registry) = &self.schemas {
+                    registry.validate(topition.topic(), &batch).await?;
+                }
+            }
+            return self
+                .transactional_produce(transaction_id, topition, deflated, attributes.control, None)
+                .await;
+        }
+        if transaction_id.is_some() {
+            return Err(Error::Api(ErrorCode::InvalidTxnState));
+        }
 
         if self.lake.is_some()
             && config
@@ -1275,7 +1265,7 @@ impl Storage for DynoStore {
             // was never actually written.
             if deflated.is_idempotent() {
                 self.meta
-                    .with(&self.object_store, |meta| {
+                    .with_fresh(&self.object_store, |meta| {
                         let Some(pd) = meta.producers.get(&deflated.producer_id) else {
                             debug!(producer_id = deflated.producer_id, ?meta.producers);
                             return Err(Error::Api(ErrorCode::UnknownProducerId));
@@ -1367,50 +1357,6 @@ impl Storage for DynoStore {
                 .await
                 .inspect(|store| debug!(?store))
                 .inspect_err(|err| debug!(?err))?;
-            }
-
-            if let Some(transaction_id) = transaction_id
-                && attributes.transaction
-            {
-                self.meta
-                    .with_mut(&self.object_store, |meta| {
-                        if let Some(transaction) = meta.transactions.get_mut(transaction_id) {
-                            debug!(?transaction);
-
-                            if let Some(txn_detail) =
-                                transaction.epochs.get_mut(&deflated.producer_epoch)
-                            {
-                                debug!(?txn_detail);
-
-                                let offset_end = offset + deflated.last_offset_delta as i64;
-
-                                _ = txn_detail
-                                    .produces
-                                    .entry(topition.topic.clone())
-                                    .or_default()
-                                    .entry(topition.partition)
-                                    .and_modify(|entry| {
-                                        let range = entry.get_or_insert(TxnProduceOffset {
-                                            offset_start: offset,
-                                            offset_end,
-                                        });
-
-                                        if offset_end > range.offset_end {
-                                            range.offset_end = offset_end;
-                                        }
-                                    })
-                                    .or_insert(Some(TxnProduceOffset {
-                                        offset_start: offset,
-                                        offset_end,
-                                    }));
-                            }
-                        }
-
-                        Ok(())
-                    })
-                    .await
-                    .inspect(|outcome| debug!(?outcome, transaction_id, ?topition))
-                    .inspect_err(|err| error!(?err, transaction_id, ?topition))?;
             }
 
             let location = Path::from(format!(
@@ -1561,13 +1507,21 @@ impl Storage for DynoStore {
                 .unwrap_or_default()
         };
 
-        let high_watermark = self.offset_stage(topition).await.map(|offset_stage| {
-            if isolation_level == IsolationLevel::ReadCommitted {
-                offset_stage.last_stable
-            } else {
-                offset_stage.high_watermark
-            }
-        })?;
+        let high_watermark = if isolation_level == IsolationLevel::ReadCommitted {
+            self.offset_stage(topition).await?.last_stable
+        } else {
+            let watermark = self
+                .watermarks
+                .lock()?
+                .entry(topition.clone())
+                .or_insert_with(|| OptiCon::<Watermark>::new(&self.cluster, topition))
+                .clone();
+            watermark
+                .with(&self.object_store, |watermark| {
+                    Ok(watermark.high.unwrap_or_default())
+                })
+                .await?
+        };
 
         debug!(high_watermark);
 
@@ -1665,9 +1619,24 @@ impl Storage for DynoStore {
     }
 
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
+        let watermark = self.watermarks.lock().map(|mut locked| {
+            locked
+                .entry(topition.to_owned())
+                .or_insert(OptiCon::<Watermark>::new(self.cluster.as_str(), topition))
+                .to_owned()
+        })?;
+
+        let (high_watermark, log_start) = watermark
+            .with_fresh(&self.object_store, |watermark| {
+                Ok((
+                    watermark.high.unwrap_or_default(),
+                    watermark.low.unwrap_or_default(),
+                ))
+            })
+            .await?;
         let stable = self
             .meta
-            .with(&self.object_store, |meta| {
+            .with_fresh(&self.object_store, |meta| {
                 Ok(meta
                     .transactions
                     .values()
@@ -1704,29 +1673,16 @@ impl Storage for DynoStore {
             })
             .await?;
 
-        debug!(?stable);
-
-        let watermark = self.watermarks.lock().map(|mut locked| {
-            locked
-                .entry(topition.to_owned())
-                .or_insert(OptiCon::<Watermark>::new(self.cluster.as_str(), topition))
-                .to_owned()
-        })?;
-
-        watermark
-            .with(&self.object_store, |watermark| {
-                debug!(?watermark);
-                let high_watermark = watermark.high.unwrap_or(0);
-                let log_start = watermark.low.unwrap_or(0);
-                let last_stable = stable.get(topition).copied().unwrap_or(high_watermark);
-
-                Ok(OffsetStage {
-                    last_stable,
-                    high_watermark,
-                    log_start,
-                })
-            })
-            .await
+        let last_stable = stable
+            .get(topition)
+            .copied()
+            .unwrap_or(high_watermark)
+            .min(high_watermark);
+        Ok(OffsetStage {
+            last_stable,
+            high_watermark,
+            log_start,
+        })
     }
 
     async fn list_offsets(
@@ -1734,48 +1690,26 @@ impl Storage for DynoStore {
         isolation_level: IsolationLevel,
         offsets: &[(Topition, ListOffset)],
     ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
-        let stable = if isolation_level == IsolationLevel::ReadCommitted {
-            self.meta
-                .with(&self.object_store, |meta| {
-                    Ok(meta
-                        .transactions
-                        .values()
-                        .flat_map(|txn| {
-                            txn.epochs
-                                .values()
-                                .filter(|detail| {
-                                    detail.state.is_some_and(|state| {
-                                        state != TxnState::Committed && state != TxnState::Aborted
-                                    })
-                                })
-                                .map(BTreeMap::<Topition, Offset>::from)
-                                .collect::<Vec<_>>()
-                        })
-                        .reduce(|mut acc, e| {
-                            debug!(?acc, ?e);
-                            for (topition, offset_start) in e.iter() {
-                                _ = acc
-                                    .entry(topition.to_owned())
-                                    .and_modify(|existing_offset_start| {
-                                        if *existing_offset_start > *offset_start {
-                                            *existing_offset_start = *offset_start
-                                        }
-                                    })
-                                    .or_insert(*offset_start);
-                            }
-
-                            acc
-                        })
-                        .unwrap_or(BTreeMap::new()))
-                })
-                .await?
-        } else {
-            BTreeMap::new()
-        };
-
         let mut responses = vec![];
 
         for (topition, offset_request) in offsets {
+            let stage = self.offset_stage(topition).await?;
+            let limit = if isolation_level == IsolationLevel::ReadCommitted {
+                stage.last_stable
+            } else {
+                stage.high_watermark
+            };
+            if offset_request == &ListOffset::Latest {
+                responses.push((
+                    topition.clone(),
+                    ListOffsetResponse {
+                        error_code: ErrorCode::None,
+                        offset: Some(limit),
+                        ..Default::default()
+                    },
+                ));
+                continue;
+            }
             let location = Path::from(format!(
                 "clusters/{}/topics/{}/partitions/{:0>10}/records",
                 self.cluster, topition.topic, topition.partition,
@@ -1793,30 +1727,15 @@ impl Storage for DynoStore {
                 .inspect_err(|error| error!(?error))
                 .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
             {
-                if let Some(last) = stable.get(topition)
-                    && offset_request == &ListOffset::Latest
+                let base = meta
+                    .location
+                    .parts()
+                    .next_back()
+                    .and_then(|part| part.as_ref().get(..20)?.parse::<i64>().ok());
+                if base.is_none_or(|offset| offset >= limit) {
+                    continue;
+                }
                 {
-                    let Some(found_offset) = candidate
-                        .as_ref()
-                        .and_then(|found| found.location.parts().next_back())
-                        .and_then(|offset| i64::from_str(&offset.as_ref()[0..20]).ok())
-                    else {
-                        continue;
-                    };
-
-                    let Some(meta_offset) = meta
-                        .location
-                        .parts()
-                        .next_back()
-                        .and_then(|offset| i64::from_str(&offset.as_ref()[0..20]).ok())
-                    else {
-                        continue;
-                    };
-
-                    if meta_offset >= *last && found_offset > meta_offset {
-                        _ = candidate.replace(meta);
-                    }
-                } else {
                     match offset_request {
                         ListOffset::Earliest
                             if candidate
@@ -1930,24 +1849,19 @@ impl Storage for DynoStore {
                 .await?
                 .is_some()
             {
-                let location = self.committed_offset_location(group_id, topition)?;
-
-                let payload = serde_json::to_vec(&offset_commit)
-                    .map(Bytes::from)
-                    .map(PutPayload::from)?;
-
-                let options = PutOptions {
-                    mode: PutMode::Overwrite,
-                    attributes: json_content_type(),
-                    ..Default::default()
-                };
-
                 let error_code = self
-                    .object_store
-                    .put_opts(&location, payload, options)
+                    .meta
+                    .with_mut(&self.object_store, |meta| {
+                        _ = meta
+                            .committed_offsets
+                            .entry(group_id.into())
+                            .or_default()
+                            .entry(topition.topic.clone())
+                            .or_default()
+                            .insert(topition.partition, offset_commit.clone());
+                        Ok(())
+                    })
                     .await
-                    .inspect_err(|err| error!(?err))
-                    .inspect(|outcome| debug!(?outcome))
                     .map_or(ErrorCode::UnknownServerError, |_| ErrorCode::None);
 
                 responses.push((topition.to_owned(), error_code));
@@ -2011,6 +1925,24 @@ impl Storage for DynoStore {
             }
         }
 
+        let canonical = self
+            .meta
+            .with_fresh(&self.object_store, |meta| {
+                Ok(meta
+                    .committed_offsets
+                    .get(group_id)
+                    .cloned()
+                    .unwrap_or_default())
+            })
+            .await?;
+        for (topic, partitions) in canonical {
+            for partition in partitions.keys() {
+                topitions.push(Topition::new(topic.clone(), *partition));
+            }
+        }
+        topitions.sort();
+        topitions.dedup();
+
         self.offset_fetch(Some(group_id), topitions.as_ref(), Some(false))
             .await
     }
@@ -2024,7 +1956,24 @@ impl Storage for DynoStore {
         let mut responses = BTreeMap::new();
 
         if let Some(group_id) = group_id {
+            let canonical = self
+                .meta
+                .with_fresh(&self.object_store, |meta| {
+                    Ok(meta
+                        .committed_offsets
+                        .get(group_id)
+                        .cloned()
+                        .unwrap_or_default())
+                })
+                .await?;
             for topition in topics {
+                if let Some(commit) = canonical
+                    .get(topition.topic())
+                    .and_then(|partitions| partitions.get(&topition.partition))
+                {
+                    _ = responses.insert(topition.clone(), commit.offset);
+                    continue;
+                }
                 let location = self.committed_offset_location(group_id, topition)?;
 
                 // An object store failure may clear on a retry, so it stays a
@@ -2158,7 +2107,7 @@ impl Storage for DynoStore {
 
             _ => {
                 self.meta
-                    .with(&self.object_store, |meta| {
+                    .with_fresh(&self.object_store, |meta| {
                         let mut responses = vec![];
 
                         for (name, topic_metadata) in meta.topics.iter() {
@@ -2387,6 +2336,23 @@ impl Storage for DynoStore {
             );
         }
 
+        let groups = self
+            .meta
+            .with_fresh(&self.object_store, |meta| {
+                Ok(meta.committed_offsets.keys().cloned().collect::<Vec<_>>())
+            })
+            .await?;
+        for group in groups {
+            if !listed_groups.iter().any(|listed| listed.group_id == group) {
+                listed_groups.push(
+                    ListedGroup::default()
+                        .group_id(group)
+                        .protocol_type("consumer".into())
+                        .group_state(Some("Unknown".into()))
+                        .group_type(Some("classic".into())),
+                );
+            }
+        }
         Ok(listed_groups)
     }
 
@@ -2427,12 +2393,18 @@ impl Storage for DynoStore {
                     .await?;
 
                 debug!(group_id, ?deleted_committed_offsets);
+                let had_canonical = self
+                    .meta
+                    .with_mut(&self.object_store, |meta| {
+                        Ok(meta.committed_offsets.remove(group_id).is_some())
+                    })
+                    .await?;
 
                 results.push(
                     DeletableGroupResult::default()
                         .group_id(group_id.into())
                         .error_code(
-                            if had_group_state || !deleted_committed_offsets.is_empty() {
+                            if had_group_state || had_canonical || !deleted_committed_offsets.is_empty() {
                                 ErrorCode::None
                             } else {
                                 ErrorCode::GroupIdNotFound
@@ -2526,6 +2498,7 @@ impl Storage for DynoStore {
             NeedToRollback {
                 producer_id: i64,
                 producer_epoch: i16,
+                committed: bool,
             },
         }
 
@@ -2539,6 +2512,9 @@ impl Storage for DynoStore {
                 .meta
                 .with_mut(&self.object_store, |meta| {
                     debug!(?meta, ?claim);
+                    if meta.transactions.is_empty() {
+                        meta.transaction_history_complete = true;
+                    }
                     match meta.transactions.entry(transaction_id.to_string()) {
                         Entry::Vacant(vacant) => {
                             let id = meta
@@ -2591,31 +2567,47 @@ impl Storage for DynoStore {
                                     }
                                 }
 
-                                if txn_detail.state == Some(TxnState::Begin) {
+                                if matches!(
+                                    txn_detail.state,
+                                    Some(
+                                        TxnState::Begin
+                                            | TxnState::PrepareCommit
+                                            | TxnState::PrepareAbort
+                                    )
+                                ) {
                                     Ok(InitProducer::NeedToRollback {
                                         producer_id: occupied.get().producer,
                                         producer_epoch: *current_epoch,
+                                        committed: txn_detail.state
+                                            == Some(TxnState::PrepareCommit),
                                     })
                                 } else {
-                                    let id = occupied.get().producer;
-                                    let epoch = current_epoch + 1;
-
-                                    _ = meta.producers.entry(id).and_modify(|pd| {
-                                        assert_eq!(
-                                            None,
-                                            pd.sequences.insert(epoch, BTreeMap::new())
-                                        );
-                                    });
-
-                                    assert_eq!(
-                                        None,
-                                        occupied.get_mut().epochs.insert(
-                                            epoch,
-                                            TxnDetail {
-                                                transaction_timeout_ms,
-                                                ..Default::default()
-                                            }
-                                        )
+                                    let old_id = occupied.get().producer;
+                                    let (id, epoch) =
+                                        if let Some(epoch) = current_epoch.checked_add(1) {
+                                            (old_id, epoch)
+                                        } else {
+                                            let id = meta
+                                                .producers
+                                                .last_key_value()
+                                                .map_or(Some(1), |(id, _)| id.checked_add(1))
+                                                .ok_or(Error::Api(ErrorCode::UnknownServerError))?;
+                                            (id, 0)
+                                        };
+                                    // Completed transaction history lives in `aborted`, not epochs.
+                                    _ = meta.producers.remove(&old_id);
+                                    let mut pd = ProducerDetail::default();
+                                    _ = pd.sequences.insert(epoch, BTreeMap::new());
+                                    _ = meta.producers.insert(id, pd);
+                                    let transaction = occupied.get_mut();
+                                    transaction.producer = id;
+                                    transaction.epochs.clear();
+                                    _ = transaction.epochs.insert(
+                                        epoch,
+                                        TxnDetail {
+                                            transaction_timeout_ms,
+                                            ..Default::default()
+                                        },
                                     );
 
                                     Ok(InitProducer::Completed(ProducerIdResponse {
@@ -2642,13 +2634,14 @@ impl Storage for DynoStore {
                 InitProducer::NeedToRollback {
                     producer_id: rollback_producer_id,
                     producer_epoch: rollback_producer_epoch,
+                    committed,
                 } => {
                     let error_code = self
                         .txn_end(
                             transaction_id,
                             rollback_producer_id,
                             rollback_producer_epoch,
-                            false,
+                            committed,
                         )
                         .await?;
 
@@ -2699,12 +2692,18 @@ impl Storage for DynoStore {
 
     async fn txn_add_offsets(
         &self,
-        _transaction_id: &str,
-        _producer_id: i64,
-        _producer_epoch: i16,
+        transaction_id: &str,
+        producer_id: i64,
+        producer_epoch: i16,
         _group_id: &str,
     ) -> Result<ErrorCode> {
-        Ok(ErrorCode::None)
+        self.meta
+            .with_mut(&self.object_store, |meta| {
+                meta.transaction_mut(transaction_id, producer_id, producer_epoch)?
+                    .begin()?;
+                Ok(ErrorCode::None)
+            })
+            .await
     }
 
     async fn txn_add_partitions(
@@ -2821,6 +2820,7 @@ impl Storage for DynoStore {
                         }
 
                         let txn_detail = current_epoch.get_mut();
+                        txn_detail.begin()?;
 
                         let mut results = vec![];
 
@@ -2848,9 +2848,6 @@ impl Storage for DynoStore {
                                     .results_by_partition(Some(results_by_partition)),
                             )
                         }
-
-                        txn_detail.started_at = Some(SystemTime::now());
-                        txn_detail.state = Some(TxnState::Begin);
 
                         Ok(TxnAddPartitionsResponse::VersionZeroToThree(results))
                     })
@@ -2898,6 +2895,7 @@ impl Storage for DynoStore {
                 }
 
                 let txn_detail = current_epoch.get_mut();
+                txn_detail.begin()?;
 
                 let mut responses = vec![];
 
@@ -2948,270 +2946,8 @@ impl Storage for DynoStore {
         producer_epoch: i16,
         committed: bool,
     ) -> Result<ErrorCode> {
-        let produced = self
-            .meta
-            .with_mut(&self.object_store, |meta| {
-                debug!(transactions = ?meta.transactions);
-
-                let Some(transaction) = meta.transactions.get_mut(transaction_id) else {
-                    return Err(Error::Api(ErrorCode::TransactionalIdNotFound));
-                };
-
-                if transaction.producer != producer_id {
-                    return Err(Error::Api(ErrorCode::UnknownProducerId));
-                }
-
-                let Some(mut current_epoch) = transaction.epochs.last_entry() else {
-                    return Err(Error::Api(ErrorCode::ProducerFenced));
-                };
-
-                if &producer_epoch != current_epoch.key() {
-                    return Err(Error::Api(ErrorCode::ProducerFenced));
-                }
-
-                let txn_detail = current_epoch.get_mut();
-
-                // A retry must repeat the decision that was prepared:
-                // markers of the opposite kind after the first would
-                // commit some partitions and abort others.
-                match (&txn_detail.state, committed) {
-                    (Some(TxnState::PrepareCommit), false)
-                    | (Some(TxnState::PrepareAbort), true) => {
-                        debug!(state = ?txn_detail.state, committed);
-                        return Err(Error::Api(ErrorCode::InvalidTxnState));
-                    }
-                    _ => {}
-                }
-
-                if txn_detail.state == Some(TxnState::Begin) {
-                    assert_eq!(
-                        Some(TxnState::Begin),
-                        txn_detail.state.replace(if committed {
-                            TxnState::PrepareCommit
-                        } else {
-                            TxnState::PrepareAbort
-                        })
-                    );
-                }
-
-                let mut produced = vec![];
-
-                // Recomputed from whatever is still in `produces` whenever
-                // we're in (freshly, or already) a `Prepare*` state, not
-                // only on a fresh transition out of `Begin`: `produces`
-                // isn't cleared until every marker below has been written
-                // and the transaction moves past `Prepare*` (further down
-                // in `txn_end`), so a retry after a partial failure here
-                // (some partitions' end-of-transaction marker written,
-                // others not) recomputes the same set and retries the
-                // missing ones, rather than computing an empty set and
-                // silently completing the transaction with some partitions
-                // never marked. Retrying a partition whose marker already
-                // landed just writes a second, harmless marker at a new
-                // offset - strictly better than one that's missing
-                // forever.
-                if matches!(
-                    txn_detail.state,
-                    Some(TxnState::PrepareCommit) | Some(TxnState::PrepareAbort)
-                ) {
-                    for (topic, partitions) in &txn_detail.produces {
-                        for (partition, offset_range) in partitions {
-                            debug!(?topic, partition, ?offset_range);
-
-                            if offset_range.is_some() {
-                                produced.push(Topition::new(topic.to_owned(), *partition));
-                            }
-                        }
-                    }
-                }
-
-                Ok(produced)
-            })
+        self.end_transaction(transaction_id, producer_id, producer_epoch, committed, None)
             .await
-            .inspect(|produced| debug!(?produced))
-            .inspect_err(|err| error!(?err))?;
-
-        for topition in produced {
-            debug!(?topition);
-
-            let control_batch: Bytes = if committed {
-                ControlBatch::default().commit().try_into()?
-            } else {
-                ControlBatch::default().abort().try_into()?
-            };
-
-            let end_transaction_marker: Bytes = EndTransactionMarker::default().try_into()?;
-
-            let batch = inflated::Batch::builder()
-                .record(
-                    Record::builder()
-                        .key(control_batch.into())
-                        .value(end_transaction_marker.into()),
-                )
-                .attributes(
-                    BatchAttribute::default()
-                        .control(true)
-                        .transaction(true)
-                        .into(),
-                )
-                .producer_id(producer_id)
-                .producer_epoch(producer_epoch)
-                .base_sequence(-1)
-                .build()
-                .and_then(TryInto::try_into)
-                .inspect(|deflated| debug!(?deflated))?;
-
-            _ = self
-                .produce(Some(transaction_id), &topition, batch)
-                .await
-                .inspect(|offset| {
-                    debug!(
-                        offset,
-                        ?topition,
-                        producer_id,
-                        producer_epoch,
-                        transaction_id,
-                        committed,
-                    )
-                })
-                .inspect_err(|err| {
-                    error!(
-                        ?err,
-                        ?topition,
-                        producer_id,
-                        producer_epoch,
-                        transaction_id,
-                        committed,
-                    )
-                })?;
-        }
-
-        let offsets_to_commit = self
-            .meta
-            .with_mut(&self.object_store, |meta| {
-                debug!(transactions = ?meta.transactions);
-
-                let Some(transaction) = meta.transactions.get_mut(transaction_id) else {
-                    return Err(Error::Api(ErrorCode::TransactionalIdNotFound));
-                };
-
-                if transaction.producer != producer_id {
-                    return Err(Error::Api(ErrorCode::UnknownProducerId));
-                }
-
-                let Some(current_epoch) = transaction.epochs.last_entry() else {
-                    return Err(Error::Api(ErrorCode::ProducerFenced));
-                };
-
-                if &producer_epoch != current_epoch.key() {
-                    return Err(Error::Api(ErrorCode::ProducerFenced));
-                }
-
-                let mut overlaps =
-                    meta.overlapping_transactions(transaction_id, producer_id, producer_epoch)?;
-                debug!(?overlaps);
-
-                let mut offsets_to_commit: BTreeMap<
-                    Group,
-                    BTreeMap<Topic, BTreeMap<Partition, TxnCommitOffset>>,
-                > = BTreeMap::new();
-
-                if overlaps.iter().all(|txn_id| txn_id.state.is_prepared()) {
-                    let txn_ids = {
-                        overlaps.push(TxnId {
-                            transaction: transaction_id.into(),
-                            producer_id,
-                            producer_epoch,
-                            state: if committed {
-                                TxnState::PrepareCommit
-                            } else {
-                                TxnState::PrepareAbort
-                            },
-                        });
-
-                        overlaps
-                    };
-
-                    for txn_id in txn_ids {
-                        debug!(?txn_id);
-
-                        if let Some(txn) = meta.transactions.get_mut(txn_id.transaction.as_str())
-                            && let Some(txn_detail) = txn.epochs.get_mut(&txn_id.producer_epoch)
-                        {
-                            debug!(?txn_detail);
-
-                            match txn_detail.state {
-                                None | Some(TxnState::PrepareCommit) => {
-                                    _ = txn_detail.state.replace(TxnState::Committed);
-                                }
-
-                                Some(TxnState::PrepareAbort) => {
-                                    _ = txn_detail.state.replace(TxnState::Aborted);
-                                }
-
-                                otherwise => {
-                                    warn!(
-                                        transaction = txn_id.transaction,
-                                        producer = txn_id.producer_id,
-                                        epoch = txn_id.producer_epoch,
-                                        ?otherwise,
-                                    );
-
-                                    continue;
-                                }
-                            }
-
-                            if txn_id.state == TxnState::PrepareCommit {
-                                for (group, topics) in txn_detail.offsets.iter() {
-                                    for (topic, partitions) in topics.iter() {
-                                        for (partition, committed_offset) in partitions {
-                                            _ = offsets_to_commit
-                                                .entry(group.to_owned())
-                                                .or_default()
-                                                .entry(topic.to_owned())
-                                                .or_default()
-                                                .insert(*partition, committed_offset.to_owned());
-                                        }
-                                    }
-                                }
-                            }
-
-                            txn_detail.produces.clear();
-                            txn_detail.offsets.clear();
-                            _ = txn_detail.started_at.take();
-                        }
-                    }
-                }
-
-                Ok(offsets_to_commit)
-            })
-            .await
-            .inspect(|outcome| debug!(?outcome))
-            .inspect_err(|err| error!(?err))?;
-
-        debug!(?offsets_to_commit);
-
-        for (group, topics) in offsets_to_commit.iter() {
-            let mut offsets = vec![];
-
-            for (topic, partitions) in topics.iter() {
-                for (partition, txn_co) in partitions {
-                    let tp = Topition::new(topic.to_owned(), *partition);
-                    let ocr = OffsetCommitRequest {
-                        offset: txn_co.committed_offset,
-                        leader_epoch: txn_co.leader_epoch,
-                        timestamp: None,
-                        metadata: txn_co.metadata.clone(),
-                    };
-
-                    offsets.push((tp, ocr));
-                }
-            }
-
-            _ = self.offset_commit(group, None, &offsets[..]).await?;
-        }
-
-        Ok(ErrorCode::None)
     }
 
     async fn maintain(&self, _now: SystemTime) -> Result<()> {
@@ -3227,17 +2963,88 @@ impl Storage for DynoStore {
         Ok(())
     }
 
-    async fn maintain_transactions(&self, _now: SystemTime) -> Result<()> {
+    async fn maintain_transactions(&self, now: SystemTime) -> Result<()> {
+        let pending = self
+            .meta
+            .with_fresh(&self.object_store, |meta| {
+                let mut pending = vec![];
+                for (id, txn) in &meta.transactions {
+                    for (epoch, detail) in &txn.epochs {
+                        let decision = match detail.state {
+                            Some(TxnState::PrepareCommit) => Some(true),
+                            Some(TxnState::PrepareAbort) => Some(false),
+                            Some(TxnState::Begin)
+                                if detail.started_at.is_some_and(|started| {
+                                    now.duration_since(started).unwrap_or_default()
+                                        >= Duration::from_millis(
+                                            detail.transaction_timeout_ms.max(0) as u64,
+                                        )
+                                }) =>
+                            {
+                                Some(false)
+                            }
+                            _ => None,
+                        };
+                        if let Some(committed) = decision {
+                            pending.push((
+                                id.clone(),
+                                txn.producer,
+                                *epoch,
+                                committed,
+                                detail.attempt,
+                            ));
+                        }
+                    }
+                }
+                Ok(pending)
+            })
+            .await?;
+        for (id, producer, epoch, committed, attempt) in pending {
+            _ = self
+                .end_transaction(&id, producer, epoch, committed, Some(attempt))
+                .await?;
+        }
         Ok(())
+    }
+
+    async fn supports_transactional_consumption(&self) -> Result<bool> {
+        if self.lake.is_some() {
+            return Ok(false);
+        }
+        self.meta
+            .with_fresh(&self.object_store, |meta| {
+                Ok(meta.transaction_history_complete || meta.transactions.is_empty())
+            })
+            .await
     }
 
     async fn aborted_transactions(
         &self,
-        _topition: &Topition,
-        _offset: i64,
-        _last_stable_offset: i64,
+        topition: &Topition,
+        offset: i64,
+        last_stable_offset: i64,
     ) -> Result<Vec<AbortedTransaction>> {
-        Ok(vec![])
+        self.meta
+            .with_fresh(&self.object_store, |meta| {
+                let mut aborted = meta
+                    .aborted
+                    .get(topition.topic())
+                    .and_then(|partitions| partitions.get(&topition.partition))
+                    .into_iter()
+                    .flatten()
+                    .filter(|range| {
+                        range.last_offset >= offset && range.first_offset < last_stable_offset
+                    })
+                    .map(|range| {
+                        AbortedTransaction::default()
+                            .producer_id(range.producer_id)
+                            .first_offset(range.first_offset)
+                    })
+                    .collect::<Vec<_>>();
+                aborted.sort_by_key(|transaction| transaction.first_offset);
+                Ok(aborted)
+            })
+            .await
     }
 
     async fn cluster_id(&self) -> Result<String> {

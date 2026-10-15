@@ -133,6 +133,34 @@ where
         }
     }
 
+    /// Bypass conditional-read caches and evaluate this request's own snapshot.
+    /// Transaction visibility must not depend on a broker's metadata cache TTL.
+    pub(super) async fn with_fresh<E, F>(&self, object_store: &impl ObjectStore, f: F) -> Result<E>
+    where
+        F: Fn(&D) -> Result<E>,
+    {
+        match object_store.get(&self.path).await {
+            Ok(result) => {
+                let version = Some(UpdateVersion {
+                    e_tag: result.meta.e_tag.clone(),
+                    version: result.meta.version.clone(),
+                });
+                let data = serde_json::from_slice::<D>(&result.bytes().await?)?;
+                let outcome = f(&data);
+                _ = self
+                    .data_version
+                    .lock()?
+                    .replace(DataVersion { data, version });
+                outcome
+            }
+            Err(object_store::Error::NotFound { .. }) => {
+                _ = self.data_version.lock()?.take();
+                f(&D::default())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     #[instrument(skip_all, fields(path = %self.path))]
     pub(super) async fn with<E, F>(&self, object_store: &impl ObjectStore, f: F) -> Result<E>
     where
@@ -248,6 +276,9 @@ where
             );
         };
 
+        // Validate against a current snapshot even when a rejected closure does
+        // not attempt a conditional PUT (and therefore cannot discover conflict).
+        self.get(object_store).await?;
         loop {
             REQUESTS.add(1, &[KeyValue::new("method", "with_mut_loop")]);
 
@@ -257,6 +288,8 @@ where
                 (outcome, dv)
             })?;
 
+            // A rejected mutation must never publish its partially changed data.
+            let outcome = outcome?;
             let payload = serde_json::to_vec(&dv.data)
                 .map(Bytes::from)
                 .map(PutPayload::from)?;
@@ -289,7 +322,7 @@ where
                                 }),
                             })
                         })
-                        .and(outcome);
+                        .map(|_| outcome);
                 }
 
                 Err(

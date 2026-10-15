@@ -27,13 +27,10 @@ use rama::{Service as _, extensions::Extensions};
 
 use crate::dynostore::{DynoStore, tests::init_tracing};
 
-/// Two brokers share one bucket. A consumer whose position came from
-/// broker A fetches through broker B, which still reads the high watermark
-/// from before A's writes. B answers `NONE` with no records, so the consumer
-/// keeps its position and catches up on a later fetch, instead of applying
-/// `auto.offset.reset`.
+/// A second broker refreshes the shared bucket's watermark on every stage read.
+/// Transaction visibility and retention checks must not use its previous TTL.
 #[tokio::test]
-async fn fetch_ahead_of_a_stale_high_watermark() -> Result<(), Error> {
+async fn fetch_refreshes_another_brokers_watermark() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
     let bucket = Arc::new(InMemory::new());
@@ -69,7 +66,10 @@ async fn fetch_ahead_of_a_stale_high_watermark() -> Result<(), Error> {
     }
 
     let high_watermark = a.offset_stage(&topition).await?.high_watermark();
-    assert_eq!(stale, b.offset_stage(&topition).await?.high_watermark());
+    assert_eq!(
+        high_watermark,
+        b.offset_stage(&topition).await?.high_watermark()
+    );
     assert!(stale < high_watermark, "{stale} < {high_watermark}");
 
     let response = FetchService { storage: b }
@@ -102,9 +102,7 @@ async fn fetch_ahead_of_a_stale_high_watermark() -> Result<(), Error> {
         ErrorCode::None,
         ErrorCode::try_from(partitions[0].error_code)?
     );
-    // B answered from its cached (stale) high watermark; had the cache
-    // entry expired, the fetch would have taken the fresh path instead
-    assert_eq!(stale, partitions[0].high_watermark);
+    assert_eq!(high_watermark, partitions[0].high_watermark);
     assert!(partitions[0].records.is_none());
 
     Ok(())
