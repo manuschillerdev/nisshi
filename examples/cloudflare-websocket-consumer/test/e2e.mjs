@@ -20,6 +20,7 @@ const kafkaPort = Number(process.env.NISSHI_KAFKA_PORT ?? 29092);
 const workerPort = Number(process.env.NISSHI_WORKER_PORT ?? 28787);
 const runId = randomUUID();
 const topic = `ws-e2e-${runId}`;
+const outputTopic = `ws-results-${runId}`;
 const groupId = `ws-e2e-${runId}`;
 const secret = randomUUID();
 const events = [];
@@ -27,9 +28,11 @@ const require = createRequire(import.meta.url);
 const versions = Object.fromEntries(["miniflare", "workerd", "kafkajs", "esbuild"].map((name) => [name, require(`${name}/package.json`).version]));
 versions.node = process.version;
 const sourceRevision = execFileSync("git", ["rev-parse", "HEAD"], { cwd: example, encoding: "utf8" }).trim();
+const sourceDirty = execFileSync("git", ["status", "--porcelain"], { cwd: example, encoding: "utf8" }).trim().length > 0;
 const sourceHashes = Object.fromEntries(["test/e2e.mjs", "test/consumer.ts", "src/index.ts"].map((path) => [path, createHash("sha256").update(readFileSync(join(example, path))).digest("hex")]));
-const report = { run_id: runId, scope: "local workerd automatic idle hibernation; no Cloudflare deployment", status: "running", source_revision: sourceRevision, source_sha256: sourceHashes, versions, events };
-let runtime, broker, producer, admin, brokerLog, temporary;
+const report = { run_id: runId, scope: "local workerd automatic idle hibernation; no Cloudflare deployment", status: "running", source_revision: sourceRevision, source_dirty: sourceDirty, source_sha256: sourceHashes, versions, events };
+let runtime, broker, producer, transactionalProducer, outputConsumer, admin, brokerLog, temporary;
+const outputs = [];
 
 async function until(description, check, milliseconds = 30_000) {
   const deadline = Date.now() + milliseconds;
@@ -51,11 +54,11 @@ async function committed(expected) {
   });
 }
 
-function assertRecord(delivery, phase, offset) {
+function assertRecord(delivery, phase, offset, nextOffset = String(Number(offset) + 1)) {
   assert.equal(delivery.group_id, groupId);
   assert.equal(delivery.topic, topic);
   assert.equal(delivery.partition, 0);
-  assert.equal(delivery.next_offset, String(Number(offset) + 1));
+  assert.equal(delivery.next_offset, nextOffset);
   assert.equal(delivery.records.length, 1);
   const record = delivery.records[0];
   assert.equal(record.offset, offset);
@@ -69,11 +72,15 @@ function assertRecord(delivery, phase, offset) {
   ]);
 }
 
-async function produce(phase) {
-  return producer.send({ topic, messages: [{ partition: 0, key: `${runId}:${phase}`,
+function input(phase) {
+  return { topic, messages: [{ partition: 0, key: `${runId}:${phase}`,
     value: JSON.stringify({ run_id: runId, phase }),
     headers: { phase, binary: Buffer.from([0, 255]), duplicate: ["one", "two"] },
-  }] });
+  }] };
+}
+
+async function produce(phase) {
+  return producer.send(input(phase));
 }
 
 async function state() {
@@ -101,13 +108,13 @@ try {
     workers: [{ config: {
       name: "nisshi-ws-e2e", compatibilityDate: "2026-10-15",
       manifest: { mainModule: "index.js", modulesRoot: example, modules: { "index.js": { type: "esm", contents: bundled.outputFiles[0].text } } },
-      env: { PUSH_TOKEN: { type: "text", value: secret }, CONSUMERS: { type: "durable-object", worker: "nisshi-ws-e2e", exportName: "ObservedConsumer" } },
+      env: { PUSH_TOKEN: { type: "text", value: secret }, OUTPUT_TOPIC: { type: "text", value: outputTopic }, CONSUMERS: { type: "durable-object", worker: "nisshi-ws-e2e", exportName: "ObservedConsumer" } },
       exports: { ObservedConsumer: { type: "durable-object", storage: "sqlite" } },
     } }],
   });
   await runtime.ready;
   const configuration = join(temporary, "subscriptions.json");
-  writeFileSync(configuration, JSON.stringify({ subscriptions: [{ group_id: groupId, topic, partition: 0, endpoint: `ws://127.0.0.1:${workerPort}/consumer`, bearer_token_env: "NISSHI_E2E_TOKEN" }] }));
+  writeFileSync(configuration, JSON.stringify({ subscriptions: [{ group_id: groupId, topic, partition: 0, endpoint: `ws://127.0.0.1:${workerPort}/consumer`, bearer_token_env: "NISSHI_E2E_TOKEN", transactional_id: `ws-output-${runId}`, output_topics: [outputTopic] }] }));
   brokerLog = openSync(join(output, "broker.log"), "w");
   broker = spawn(binary, ["broker", "--silent", "--listener-url", `tcp://127.0.0.1:${kafkaPort}`, "--advertised-listener-url", `tcp://127.0.0.1:${kafkaPort}`, "--storage-engine", "memory://", "--websocket-push-config", configuration], {
     cwd: temporary, env: { PATH: process.env.PATH, HOME: process.env.HOME, RUST_LOG: "nisshi_broker=info", NISSHI_E2E_TOKEN: secret }, stdio: ["ignore", brokerLog, brokerLog],
@@ -122,9 +129,17 @@ try {
   const kafka = new Kafka({ clientId: "nisshi-ws-e2e", brokers: [`127.0.0.1:${kafkaPort}`], logLevel: logLevel.ERROR });
   admin = kafka.admin();
   await admin.connect();
-  await admin.createTopics({ topics: [{ topic, numPartitions: 1, replicationFactor: 1 }], waitForLeaders: true });
+  await admin.createTopics({ topics: [topic, outputTopic].map((topic) => ({ topic, numPartitions: 1, replicationFactor: 1 })), waitForLeaders: true });
   producer = kafka.producer({ idempotent: false });
   await producer.connect();
+  transactionalProducer = kafka.producer({ transactionalId: `source-${runId}`, maxInFlightRequests: 1, idempotent: true });
+  await transactionalProducer.connect();
+  outputConsumer = kafka.consumer({ groupId: `output-${runId}`, readUncommitted: false });
+  await outputConsumer.connect();
+  await outputConsumer.subscribe({ topic: outputTopic, fromBeginning: true });
+  await outputConsumer.run({ autoCommit: false, eachMessage: async ({ message }) => {
+    outputs.push({ key: message.key?.toString(), value: JSON.parse(message.value.toString()), offset: message.offset });
+  } });
   const upgrade = await until("initial websocket upgrade", () => events.find((entry) => entry.event === "upgrade"));
   const firstProduce = await produce("before-eviction");
   const first = await until("first record processed", () => events.find((entry) => entry.event === "processed" && entry.next_offset === "1"));
@@ -154,17 +169,63 @@ try {
   const afterOffset = await committed("2");
   const finalState = await state();
   assert.deepEqual(finalState, { next_offset: "2", count: "2" });
-  Object.assign(report, { status: "passed", topic, group_id: groupId, kafka_produce: [firstProduce, secondProduce], committed_offsets: [beforeOffset, afterOffset], durable_state: finalState,
+  Object.assign(report, { topic, output_topic: outputTopic, group_id: groupId, kafka_produce: [firstProduce, secondProduce], committed_offsets: [beforeOffset, afterOffset], durable_state: finalState,
     hibernation: { method: "automatic local workerd idle eviction", forced: false, idle_started_at: idleStartedAt, idle_ms: idleMilliseconds, actor_callbacks_during_idle: callbacksDuringIdle },
-    before_instance_id: first.instance_id, after_instance_id: second.instance_id, connection_id: first.connection_id, websocket_upgrades: 1,
+    before_instance_id: first.instance_id, after_instance_id: second.instance_id, connection_id: first.connection_id, websocket_upgrades_at_hibernation_check: 1,
   });
-  console.log(JSON.stringify({ status: report.status, committed_offsets: report.committed_offsets, connection_id: report.connection_id, websocket_upgrades: report.websocket_upgrades, report: join(output, "report.json") }, null, 2));
+
+  // Transaction visibility: neither open nor aborted source intents may reach the actor.
+  const beforeTransactions = events.filter((entry) => entry.event === "message").length;
+  const aborted = await transactionalProducer.transaction();
+  await aborted.send(input("aborted-intent"));
+  await sleep(1_000);
+  assert.equal(events.filter((entry) => entry.event === "message").length, beforeTransactions);
+  await aborted.abort();
+  await committed("4");
+  assert.equal(events.filter((entry) => entry.event === "message").length, beforeTransactions);
+  const committedInput = await transactionalProducer.transaction();
+  await committedInput.send(input("committed-intent"));
+  await sleep(1_000);
+  assert.equal(events.filter((entry) => entry.event === "message").length, beforeTransactions);
+  await committedInput.commit();
+  await committed("6");
+  const committedMessage = await until("committed intent delivered", () => events.find((entry) => entry.event === "message" && entry.delivery.records[0].offset === "4"));
+  assertRecord(committedMessage.delivery, "committed-intent", "4", "6");
+
+  // Abort a produced output before EndTxn commit, then retry the source delivery.
+  await produce("abort-output-once");
+  await until("injected output abort", () => events.some((entry) => entry.event === "injected_abort"));
+  await committed("7");
+  await until("four committed source effects", async () => (await state())?.count === "4");
+
+  // Drop the commit response before the application sees it. Reconnection must
+  // reconcile the Kafka offset, not produce the output again.
+  await produce("lost-commit-response");
+  await until("lost commit response", () => events.some((entry) => entry.event === "dropped_commit_response"));
+  await committed("8");
+  await until("receipt recovered on reconnect", async () => (await state())?.count === "5");
+  await until("committed outputs", () => outputs.length >= 5);
+  await sleep(1_000);
+  const expectedPhases = ["before-eviction", "after-eviction", "committed-intent", "abort-output-once", "lost-commit-response"];
+  assert.deepEqual(outputs.map((entry) => entry.value.phase), expectedPhases);
+  for (const output of outputs) {
+    assert.equal(output.key, `${runId}:${output.value.phase}`);
+    assert.equal(output.value.run_id, runId);
+  }
+  assert.equal(events.filter((entry) => entry.event === "message" && JSON.parse(Buffer.from(entry.delivery.records[0].value, "base64").toString()).phase === "lost-commit-response").length, 1);
+  Object.assign(report, { status: "passed", outputs, final_state: await state(), final_committed_offset: "8", websocket_upgrades_total: events.filter((entry) => entry.event === "upgrade").length, transaction_checks: {
+    open_inputs_hidden: true, aborted_inputs_hidden: true, aborted_outputs_hidden: true,
+    lost_commit_response_recovered: true, duplicate_committed_outputs: 0,
+  } });
+  console.log(JSON.stringify({ status: report.status, committed_offsets: report.committed_offsets, connection_id: report.connection_id, websocket_upgrades_at_hibernation_check: report.websocket_upgrades_at_hibernation_check, report: join(output, "report.json") }, null, 2));
 } catch (error) {
-  Object.assign(report, { status: "failed", error: error.stack });
+  Object.assign(report, { status: "failed", error: error.stack, outputs });
   process.exitCode = 1;
   console.error(error);
 } finally {
   await producer?.disconnect().catch(() => {});
+  await transactionalProducer?.disconnect().catch(() => {});
+  await outputConsumer?.disconnect().catch(() => {});
   await admin?.disconnect().catch(() => {});
   if (broker?.pid && broker.exitCode === null && broker.signalCode === null) {
     broker.kill("SIGTERM");

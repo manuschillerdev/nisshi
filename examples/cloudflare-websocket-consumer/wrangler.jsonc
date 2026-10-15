@@ -5,6 +5,7 @@
   "compatibility_date": "2026-10-15",
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
+  "vars": { "OUTPUT_TOPIC": "results" },
   "durable_objects": {
     "bindings": [{ "name": "CONSUMERS", "class_name": "Consumer" }]
   },

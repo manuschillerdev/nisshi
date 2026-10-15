@@ -7,6 +7,28 @@ function record(event: string, fields: Record<string, unknown>): void {
 // Lifecycle evidence stays in the test subclass; the example's handlers do the work.
 export class ObservedConsumer extends Consumer {
   private instanceId = crypto.randomUUID();
+  private phase = "";
+  private dropCommitResponse = false;
+
+  protected async request(socket: WebSocket, method: string, params: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+    if (method === "end_txn" && params.committed === true) {
+      if (this.phase === "abort-output-once" && !await this.ctx.storage.get("aborted-once")) {
+        await this.ctx.storage.put("aborted-once", true);
+        const result = await super.request(socket, method, { ...params, committed: false });
+        record("injected_abort", { instance_id: this.instanceId });
+        socket.close(1012, "Retry aborted transaction");
+        throw new Error(`Injected abort: ${JSON.stringify(result)}`);
+      }
+      if (this.phase === "lost-commit-response" && !await this.ctx.storage.get("dropped-commit-once")) {
+        this.dropCommitResponse = true;
+      }
+    }
+    try {
+      return await super.request(socket, method, params);
+    } finally {
+      if (method === "end_txn") this.dropCommitResponse = false;
+    }
+  }
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -32,9 +54,24 @@ export class ObservedConsumer extends Consumer {
     if (typeof message !== "string") throw new Error("Expected JSON text");
     const delivery = JSON.parse(message);
     const identity = { instance_id: this.instanceId, ...socket.deserializeAttachment() };
+    if (delivery.type === "response") {
+      if (this.dropCommitResponse && delivery.error_code === 0) {
+        await this.ctx.storage.put("dropped-commit-once", true);
+        record("dropped_commit_response", identity);
+        socket.close(1012, "Lost commit response");
+        return;
+      }
+      record("response", { ...identity, response: delivery });
+      await super.webSocketMessage(socket, message);
+      return;
+    }
+    this.phase = JSON.parse(atob(delivery.records[0].value)).phase;
     record("message", { ...identity, delivery });
     await super.webSocketMessage(socket, message);
-    record("processed", { ...identity, next_offset: delivery.next_offset });
+    const progress = await this.ctx.storage.get<{ next_offset: string }>(`progress:${JSON.stringify([delivery.group_id, delivery.topic, delivery.partition])}`);
+    if (progress && BigInt(progress.next_offset) >= BigInt(delivery.next_offset)) {
+      record("processed", { ...identity, next_offset: delivery.next_offset });
+    }
   }
 }
 

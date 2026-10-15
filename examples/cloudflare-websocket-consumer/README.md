@@ -2,8 +2,11 @@
 
 The broker connects to this Worker, which forwards the connection to one named
 Durable Object. `ctx.acceptWebSocket()` keeps the connection alive while the
-object hibernates. New records invoke `webSocketMessage()`; there are no timers,
-fetch loops or outgoing connections in the actor.
+object hibernates. New committed records invoke `webSocketMessage()`. The actor
+uses request/response messages on that same socket to produce output records and
+commit its input offset in one Kafka transaction. Request timeouts exist only
+while work is in progress; there are no idle timers, polling loops or outgoing
+connections in the actor.
 
 ```sh
 npm ci
@@ -20,14 +23,23 @@ export NISSHI_PUSH_TOKEN=replace-with-your-secret
 cargo run -p nisshi --no-default-features --features dynostore -- broker --websocket-push-config examples/cloudflare-websocket-consumer/subscriptions.json
 ```
 
-Create topic `events` with one partition and produce records using your usual
-Kafka client. The broker can start before the topic exists; delivery retries.
+Create topics `events` and `results`, each with one partition, and produce records
+to `events` using your usual Kafka client. The broker can start before the topics
+exist; delivery retries. Use a fresh dynostore cluster for this example; older
+transaction history requires migration before committed-only push is safe.
 Read the counter with `curl -H "Authorization: Bearer $NISSHI_PUSH_TOKEN"
-http://127.0.0.1:8787/state`. A lost acknowledgement or reconnect replays records;
-the durable offset prevents the counter increasing twice. Both the counter and
-offset are updated in one storage transaction. Replace this counter with local
-application effects in that transaction. For external effects, use an idempotency
-key containing group, topic, partition and record offset.
+http://127.0.0.1:8787/state`. Consume `results` with `read_committed` to see outputs.
+The example copies keys, values, timestamps and headers to that topic. Replace
+that transformation with your application logic. The configured `output_topics`
+allowlist must include `OUTPUT_TOPIC` from `wrangler.jsonc`.
+
+The durable application result is the Kafka output, committed together with the
+input offset. The DO counter is a local receipt of confirmed commits, not an
+atomic transaction spanning Kafka and DO storage. A pending receipt survives a
+lost commit response and is reconciled against the broker's offset on reconnect.
+Incomplete Kafka transactions are aborted/fenced before retry. External tool
+effects still require idempotency using the input topic, partition and offset;
+Kafka transactions cannot roll back an external action.
 
 To deploy, run `npx wrangler secret put PUSH_TOKEN`, then `npm run deploy`, and
 change `endpoint` to `wss://<your-worker-host>/consumer`. Restart the broker after
@@ -39,9 +51,9 @@ Local development verifies protocol handling and durable deduplication. The test
 below also verifies automatic idle hibernation and message-triggered reconstruction
 in local workerd; production eviction timing and billing require deployment observations.
 
-The example uses one named actor. Multiple subscriptions can share it; progress
-is keyed by group/topic/partition. To use distinct actors, extend the Worker route
-with an actor name and configure each subscription's endpoint accordingly.
+The example uses one named actor with one subscription and one accepted socket.
+To use distinct actors, extend the Worker route with an actor name and configure
+each subscription's endpoint and unique `transactional_id` accordingly.
 
 See [the wire protocol and operational limits](../../docs/websocket-push.md) and
 [Cloudflare's hibernation API](https://developers.cloudflare.com/durable-objects/best-practices/websockets/).
@@ -65,7 +77,15 @@ Kafka offsets 1 then 2. The idle interval covers the broker's native Ping interv
 with no actor requests or callbacks. There is no forced eviction or runtime
 restart. The next Kafka record
 must run on a new actor instance with the original socket attachment and exactly
-one WebSocket upgrade overall.
+one WebSocket upgrade during this idle/wake check.
+
+The test then holds a source transaction open, aborts it, and verifies its intent
+never reaches the actor. It commits another source transaction and checks delivery.
+It also aborts one output transaction before retry, drops a successful commit
+response before the application receives it, and verifies recovery. A separate
+KafkaJS `read_committed` consumer sees exactly the five expected output records,
+while the source group advances to offset 8. The deliberate failure scenarios
+reconnect the socket; automatic hibernation itself does not.
 
 A test-only subclass records constructor, socket and message identities while
 calling the example's real handlers. Production example code has no eviction

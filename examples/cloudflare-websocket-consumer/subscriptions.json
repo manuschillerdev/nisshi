@@ -4,6 +4,8 @@
     "topic": "events",
     "partition": 0,
     "endpoint": "ws://127.0.0.1:8787/consumer",
-    "bearer_token_env": "NISSHI_PUSH_TOKEN"
+    "bearer_token_env": "NISSHI_PUSH_TOKEN",
+    "transactional_id": "cloudflare-example-output",
+    "output_topics": ["results"]
   }]
 }
