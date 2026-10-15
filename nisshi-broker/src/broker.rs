@@ -375,11 +375,13 @@ where
         self.register().await?;
         let mut deliveries = JoinSet::new();
         if let Some(configuration) = &self.websocket_push {
-            configuration.spawn(
-                &mut deliveries,
-                self.storage.clone(),
-                self.cancellation.clone(),
-            );
+            configuration
+                .spawn(
+                    &mut deliveries,
+                    self.storage.clone(),
+                    self.cancellation.clone(),
+                )
+                .await?;
         }
         let listener = self.listen(started);
         tokio::pin!(listener);

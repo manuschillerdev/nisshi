@@ -14,6 +14,8 @@ use tokio_tungstenite::accept_async;
 
 type Peer = WebSocketStream<TcpStream>;
 
+mod transactions;
+
 fn subscription(endpoint: String) -> Subscription {
     Subscription {
         group_id: "actor-consumer".into(),
@@ -21,6 +23,8 @@ fn subscription(endpoint: String) -> Subscription {
         partition: 0,
         endpoint: endpoint.parse().unwrap(),
         bearer_token_env: None,
+        transactional_id: None,
+        output_topics: BTreeSet::new(),
         authorization: None,
     }
 }
@@ -155,7 +159,10 @@ async fn exact_ack_commits_and_restart_resumes_after_processed_records() {
     )));
     let mut tasks = JoinSet::new();
     let cancellation = CancellationToken::new();
-    config.spawn(&mut tasks, storage.clone(), cancellation.clone());
+    config
+        .spawn(&mut tasks, storage.clone(), cancellation.clone())
+        .await
+        .unwrap();
     let mut peer = accept(&listener).await;
     let delivery = receive(&mut peer).await;
     assert_eq!("2", delivery["next_offset"]);
@@ -173,7 +180,10 @@ async fn exact_ack_commits_and_restart_resumes_after_processed_records() {
 
     produce(&storage, 1).await;
     let cancellation = CancellationToken::new();
-    config.spawn(&mut tasks, storage.clone(), cancellation.clone());
+    config
+        .spawn(&mut tasks, storage.clone(), cancellation.clone())
+        .await
+        .unwrap();
     let mut peer = accept(&listener).await;
     let delivery = receive(&mut peer).await;
     assert_eq!("2", delivery["records"][0]["offset"]);
@@ -195,7 +205,10 @@ async fn wrong_ack_and_disconnect_replay_the_same_pending_delivery() {
     )));
     let mut tasks = JoinSet::new();
     let cancellation = CancellationToken::new();
-    config.spawn(&mut tasks, storage.clone(), cancellation.clone());
+    config
+        .spawn(&mut tasks, storage.clone(), cancellation.clone())
+        .await
+        .unwrap();
     let mut peer = accept(&listener).await;
     let delivery = receive(&mut peer).await;
     let mut incorrect = delivery.clone();
@@ -224,7 +237,10 @@ async fn empty_topics_send_no_data_frames_and_cancel_without_waiting() {
     )));
     let mut tasks = JoinSet::new();
     let cancellation = CancellationToken::new();
-    config.spawn(&mut tasks, storage.clone(), cancellation.clone());
+    config
+        .spawn(&mut tasks, storage.clone(), cancellation.clone())
+        .await
+        .unwrap();
     let mut peer = accept(&listener).await;
     assert!(
         timeout(Duration::from_millis(700), peer.next())
@@ -385,6 +401,11 @@ fn configuration_rejects_invalid_endpoints_duplicates_unknown_fields_and_missing
         ("group_id", json!("")),
         ("partition", json!(-1)),
         (
+            "transactional_id",
+            json!("transaction-without-output-topics"),
+        ),
+        ("output_topics", json!(["output-without-transaction-id"])),
+        (
             "bearer_token_env",
             json!("NISSHI_MISSING_WS_TEST_SECRET_8BB6"),
         ),
@@ -440,7 +461,10 @@ async fn wss_uses_verified_tls_and_bearer_authentication() {
     };
     let mut tasks = JoinSet::new();
     let cancellation = CancellationToken::new();
-    config.spawn(&mut tasks, storage.clone(), cancellation.clone());
+    config
+        .spawn(&mut tasks, storage.clone(), cancellation.clone())
+        .await
+        .unwrap();
     let stream = timeout(Duration::from_secs(5), listener.accept())
         .await
         .unwrap()
@@ -512,11 +536,14 @@ async fn partition_commit_errors_replay_acknowledged_records() {
     )));
     let mut tasks = JoinSet::new();
     let cancellation = CancellationToken::new();
-    config.spawn(
-        &mut tasks,
-        RequestChannelService::new(sender),
-        cancellation.clone(),
-    );
+    config
+        .spawn(
+            &mut tasks,
+            RequestChannelService::new(sender),
+            cancellation.clone(),
+        )
+        .await
+        .unwrap();
     let mut peer = accept(&listener).await;
     let delivery = receive(&mut peer).await;
     ack(&mut peer, &delivery).await;
@@ -541,7 +568,10 @@ async fn cancellation_during_ack_wait_leaves_progress_uncommitted() {
     )));
     let mut tasks = JoinSet::new();
     let cancellation = CancellationToken::new();
-    config.spawn(&mut tasks, storage.clone(), cancellation.clone());
+    config
+        .spawn(&mut tasks, storage.clone(), cancellation.clone())
+        .await
+        .unwrap();
     let mut peer = accept(&listener).await;
     let _ = receive(&mut peer).await;
     cancellation.cancel();

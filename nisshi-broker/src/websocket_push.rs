@@ -41,6 +41,8 @@ const PING_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+mod rpc;
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigFile {
@@ -55,6 +57,9 @@ struct Subscription {
     partition: i32,
     endpoint: Url,
     bearer_token_env: Option<String>,
+    transactional_id: Option<String>,
+    #[serde(default)]
+    output_topics: BTreeSet<String>,
     #[serde(skip)]
     authorization: Option<HeaderValue>,
 }
@@ -71,12 +76,20 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let configuration: ConfigFile = serde_json::from_slice(&std::fs::read(path)?)?;
         let mut assignments = BTreeSet::new();
+        let mut transactions = BTreeSet::new();
         let mut subscriptions = configuration.subscriptions;
         if subscriptions.is_empty() || subscriptions.len() > 1024 {
             return Err(invalid("expected between 1 and 1024 subscriptions"));
         }
         for subscription in &mut subscriptions {
             subscription.validate()?;
+            if let Some(id) = &subscription.transactional_id
+                && !transactions.insert(id.clone())
+            {
+                return Err(invalid(
+                    "transactional_id must be unique across subscriptions",
+                ));
+            }
             if !assignments.insert((
                 subscription.group_id.clone(),
                 subscription.topic.clone(),
@@ -119,12 +132,17 @@ impl Config {
         })
     }
 
-    pub(crate) fn spawn<S: Storage + Clone>(
+    pub(crate) async fn spawn<S: Storage + Clone>(
         &self,
         tasks: &mut JoinSet<()>,
         storage: S,
         cancellation: CancellationToken,
-    ) {
+    ) -> Result<()> {
+        if !storage.supports_transactional_consumption().await? {
+            return Err(invalid(
+                "storage backend does not support committed transactional consumption",
+            ));
+        }
         for subscription in self.subscriptions.clone() {
             let storage = storage.clone();
             let cancellation = cancellation.clone();
@@ -136,6 +154,7 @@ impl Config {
                 }
             });
         }
+        Ok(())
     }
 }
 
@@ -166,6 +185,25 @@ impl Subscription {
                 "endpoint must be ws/wss with a host, without credentials, query or fragment",
             ));
         }
+        if let Some(id) = &self.transactional_id {
+            if id.is_empty() || id.len() > 255 || self.output_topics.is_empty() {
+                return Err(invalid(
+                    "transactional_id must be bounded and have output_topics",
+                ));
+            }
+        } else if !self.output_topics.is_empty() {
+            return Err(invalid("output_topics requires transactional_id"));
+        }
+        if self.output_topics.len() > 100
+            || self
+                .output_topics
+                .iter()
+                .any(|topic| topic.is_empty() || topic.len() > 249)
+        {
+            return Err(invalid(
+                "output_topics must contain at most 100 bounded topic names",
+            ));
+        }
         Ok(())
     }
 
@@ -175,10 +213,27 @@ impl Subscription {
 
     async fn run<S: Storage>(&self, storage: S, tls: Arc<rustls::ClientConfig>) {
         let mut cursor = None;
-        let mut pending = None;
+        let mut pending: Option<Delivery> = None;
         let mut retry_delay = POLL_INTERVAL;
         loop {
             let attempt = async {
+                // EndTxn may have committed even if its response was lost. Reconcile
+                // before replaying a delivery and producing its output again.
+                if self.transactional_id.is_some() && cursor.is_some() {
+                    let committed = timeout(IO_TIMEOUT, self.committed_offset(&storage))
+                        .await
+                        .map_err(|_| invalid("offset fetch timeout"))??;
+                    if let Some(delivery) = &pending {
+                        if committed == delivery.next_offset {
+                            cursor = Some(committed);
+                            pending = None;
+                        } else if Some(committed) != cursor {
+                            return Err(invalid("transaction offset changed unexpectedly"));
+                        }
+                    } else {
+                        cursor = Some(committed);
+                    }
+                }
                 if cursor.is_none() {
                     let offsets = timeout(
                         IO_TIMEOUT,
@@ -215,8 +270,8 @@ impl Subscription {
                         .insert(AUTHORIZATION, authorization.clone());
                 }
                 let limits = WebSocketConfig::default()
-                    .max_message_size(Some(4096))
-                    .max_frame_size(Some(4096));
+                    .max_message_size(Some(MAX_PAYLOAD_BYTES))
+                    .max_frame_size(Some(MAX_PAYLOAD_BYTES));
                 let (mut socket, _) = timeout(
                     IO_TIMEOUT,
                     connect_async_tls_with_config(
@@ -270,6 +325,16 @@ impl Subscription {
         }
     }
 
+    async fn committed_offset(&self, storage: &impl Storage) -> Result<i64> {
+        storage
+            .offset_fetch(Some(&self.group_id), &[self.topition()], Some(true))
+            .await?
+            .get(&self.topition())
+            .copied()
+            .filter(|offset| *offset >= 0)
+            .ok_or_else(|| invalid("missing committed subscription offset"))
+    }
+
     async fn deliver(
         &self,
         storage: &impl Storage,
@@ -283,6 +348,8 @@ impl Subscription {
         let mut pings = time::interval_at(time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
         pings.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         let mut awaiting_pong = false;
+        let mut deadline = None;
+        let mut session = rpc::Session::default();
         loop {
             tokio::select! {
                 _ = polls.tick() => {
@@ -295,18 +362,13 @@ impl Subscription {
                             *cursor = Some(next_offset);
                         }
                     }
-                    if let Some(delivery) = pending {
+                    if deadline.is_none() && let Some(delivery) = pending {
                         send(socket, Message::Text(delivery.json.clone().into())).await?;
-                        timeout(ACK_TIMEOUT, acknowledge(socket, &delivery.ack)).await
-                            .map_err(|_| invalid("acknowledgement timeout"))??;
-                        let next_offset = delivery.next_offset;
-                        self.commit(storage, next_offset).await?;
-                        *cursor = Some(next_offset);
-                        *pending = None;
-                        *retry_delay = POLL_INTERVAL;
-                        polls.reset_immediately();
-                        awaiting_pong = false;
+                        deadline = Some(time::Instant::now() + ACK_TIMEOUT);
                     }
+                },
+                _ = time::sleep_until(deadline.unwrap_or_else(|| time::Instant::now() + ACK_TIMEOUT)), if deadline.is_some() => {
+                    return Err(invalid("delivery completion timeout"));
                 },
                 _ = pings.tick() => {
                     if awaiting_pong { return Err(invalid("ping timeout")); }
@@ -316,6 +378,46 @@ impl Subscription {
                 incoming = socket.next() => match incoming {
                     Some(Ok(Message::Pong(_))) => { awaiting_pong = false; *retry_delay = POLL_INTERVAL; },
                     Some(Ok(Message::Ping(_))) => flush(socket).await?,
+                    Some(Ok(Message::Text(message))) => {
+                        if self.transactional_id.is_some() {
+                            let response = timeout(IO_TIMEOUT, self.rpc(storage, &mut session, pending.as_ref(), &message))
+                                .await.map_err(|_| invalid("transaction request timeout; reconnect to reconcile"))??;
+                            let mut recovered_commit = false;
+                            if response.committed || response.initialized {
+                                let offset = timeout(IO_TIMEOUT, self.committed_offset(storage)).await
+                                    .map_err(|_| invalid("offset reconciliation timeout"))??;
+                                if let Some(delivery) = pending {
+                                    if response.committed && offset != delivery.next_offset {
+                                        return Err(invalid("transaction did not commit pending delivery offset"));
+                                    }
+                                    if offset == delivery.next_offset {
+                                        recovered_commit = response.initialized;
+                                        *cursor = Some(offset);
+                                        *pending = None;
+                                        deadline = None;
+                                        polls.reset_immediately();
+                                    } else if Some(offset) != *cursor {
+                                        return Err(invalid("transaction offset changed unexpectedly"));
+                                    }
+                                }
+                            }
+                            send(socket, Message::Text(response.json.into())).await?;
+                            if recovered_commit {
+                                return Err(invalid("initialization completed previous commit; reconnect to resume"));
+                            }
+                            if response.reconnect { return Err(invalid("transaction request failed; reconnect to reconcile")); }
+                        } else {
+                            let ack: Ack = serde_json::from_str(&message).map_err(|_| invalid("invalid acknowledgement"))?;
+                            let delivery = pending.as_ref().ok_or_else(|| invalid("no pending delivery"))?;
+                            if ack != delivery.ack { return Err(invalid("acknowledgement does not match pending delivery")); }
+                            self.commit(storage, delivery.next_offset).await?;
+                            *cursor = Some(delivery.next_offset);
+                            *pending = None;
+                            deadline = None;
+                            polls.reset_immediately();
+                        }
+                        *retry_delay = POLL_INTERVAL;
+                    },
                     _ => return Err(invalid("connection closed or unexpected idle message")),
                 },
             }
@@ -336,15 +438,33 @@ impl Subscription {
                 cursor,
                 0,
                 MAX_PAYLOAD_BYTES as u32,
-                IsolationLevel::ReadUncommitted,
+                IsolationLevel::ReadCommitted,
                 POLL_INTERVAL,
             )
             .await?;
+        let first = batches
+            .first()
+            .map_or(cursor, |batch| batch.base_offset.min(cursor));
+        let fetched_end = batches.last().map_or(Ok(cursor), |batch| {
+            batch
+                .base_offset
+                .checked_add(i64::from(batch.last_offset_delta))
+                .and_then(|offset| offset.checked_add(1))
+                .ok_or_else(|| invalid("invalid batch offset"))
+        })?;
+        let mut aborted = storage
+            .aborted_transactions(&topition, first, fetched_end.min(stage.last_stable))
+            .await?;
+        // Retention may prune abort metadata after the batch read. Validate
+        // after both reads so those bytes can never escape without their filter.
         if cursor < storage.offset_stage(&topition).await?.log_start {
             return Err(invalid(
                 "retention advanced during fetch; stop broker, reset group offset, then restart",
             ));
         }
+        aborted.sort_by_key(|transaction| transaction.first_offset);
+        let mut aborted = aborted.into_iter().peekable();
+        let mut active_aborts = BTreeSet::new();
         let mut envelope = Envelope {
             version: 1,
             r#type: "records",
@@ -363,11 +483,29 @@ impl Subscription {
                 .checked_add(i64::from(batch.last_offset_delta))
                 .and_then(|offset| offset.checked_add(1))
                 .ok_or_else(|| invalid("invalid batch offset"))?;
+            while aborted
+                .peek()
+                .is_some_and(|transaction| transaction.first_offset <= batch.base_offset)
+            {
+                if let Some(transaction) = aborted.next() {
+                    let _ = active_aborts.insert(transaction.producer_id);
+                }
+            }
+            if batch.is_control() {
+                // The abort marker ends this producer's aborted range. A later
+                // committed transaction may reuse the same producer ID and epoch.
+                let _ = active_aborts.remove(&batch.producer_id);
+                next_offset = next_offset.max(batch_end.min(stage.last_stable));
+                continue;
+            }
             if batch_end <= cursor {
                 continue;
             }
-            if batch.is_control() {
-                next_offset = next_offset.max(batch_end);
+            if batch.base_offset >= stage.last_stable {
+                break;
+            }
+            if batch.is_transactional() && active_aborts.contains(&batch.producer_id) {
+                next_offset = next_offset.max(batch_end.min(stage.last_stable));
                 continue;
             }
             // Kafka fetch may return an oversized first batch to allow progress. The
@@ -379,7 +517,7 @@ impl Subscription {
                     .base_offset
                     .checked_add(i64::from(record.offset_delta))
                     .ok_or_else(|| invalid("invalid record offset"))?;
-                if offset < cursor {
+                if offset < cursor || offset >= stage.last_stable {
                     continue;
                 }
                 let timestamp = match attributes.timestamp {
@@ -420,7 +558,7 @@ impl Subscription {
                     .checked_add(1)
                     .ok_or_else(|| invalid("record offset overflow"))?;
             }
-            next_offset = next_offset.max(batch_end);
+            next_offset = next_offset.max(batch_end.min(stage.last_stable));
         }
         if envelope.records.is_empty() {
             return Ok((None, next_offset));
@@ -501,24 +639,5 @@ async fn flush(socket: &mut Socket) -> Result<()> {
         .map_err(|_| invalid("flush timeout"))?
         .map_err(|_| invalid("websocket flush failed"))
 }
-async fn acknowledge(socket: &mut Socket, expected: &Ack) -> Result<()> {
-    loop {
-        match socket.next().await {
-            Some(Ok(Message::Text(message))) => {
-                let ack: Ack = serde_json::from_str(&message)
-                    .map_err(|_| invalid("invalid acknowledgement"))?;
-                return if &ack == expected {
-                    Ok(())
-                } else {
-                    Err(invalid("acknowledgement does not match pending delivery"))
-                };
-            }
-            Some(Ok(Message::Ping(_))) => flush(socket).await?,
-            Some(Ok(Message::Pong(_))) => {}
-            _ => return Err(invalid("connection closed before acknowledgement")),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests;
