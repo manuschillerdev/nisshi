@@ -1,0 +1,12 @@
+{
+  "name": "nisshi-http-push-durable-object",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:e2e": "node e2e.mjs"
+  },
+  "devDependencies": {
+    "kafkajs": "2.2.4",
+    "miniflare": "5.20261012.0-beta"
+  }
+}
