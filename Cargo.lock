@@ -5816,6 +5816,7 @@ version = "0.7.0-pre.3"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "bytes",
  "clap",
  "console",
@@ -5851,6 +5852,7 @@ dependencies = [
  "rand 0.10.3",
  "rcgen",
  "regex",
+ "reqwest 0.13.5",
  "rsasl",
  "rustls",
  "serde",

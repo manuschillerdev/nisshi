@@ -80,6 +80,7 @@ apache-avro = "0.21.0"
 arrow = { version = "58" }
 async-trait = "0.1.86"
 backoff = {version = "0.4.0", features = ["tokio"]}
+base64 = "0.22.1"
 bytes = { version = "1", features = ["serde"] }
 cached = "4.0.1"
 chrono = "0.4"
@@ -152,6 +153,7 @@ rama = { version = "0.4.0", features = ["http", "tcp"] }
 rand = "0.10"
 rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
 regex = "1.12.3"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
 rhai = { version = "1.24.0", features = ["sync"] }
 rhai-rand = "0.2"
 rsasl = { version = "2.2.0", features = ["config_builder", "provider", "oauthbearer", "scram-sha-2"], default-features = false }

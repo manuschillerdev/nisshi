@@ -18,6 +18,7 @@ mod maintenance;
 use crate::{
     CancelKind, Error, Result,
     coordinator::group::{Coordinator, administrator::Controller},
+    http_push::HttpPush,
     otel,
     service::services,
 };
@@ -40,6 +41,7 @@ use std::{
     io::{self, ErrorKind},
     marker::PhantomData,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener as StdTcpListener},
+    path::PathBuf,
     str::FromStr,
     sync::Arc,
     time::{Duration, SystemTime},
@@ -188,6 +190,7 @@ pub struct Broker<G, S> {
 
     sasl_config: Option<Arc<SASLConfig>>,
     tls_server_config: Option<Arc<ServerConfig>>,
+    http_push: Option<HttpPush>,
     silent: bool,
     maintenance_interval: Option<Duration>,
     transaction_maintenance_interval: Option<Duration>,
@@ -225,6 +228,7 @@ where
 
             sasl_config: None,
             tls_server_config: None,
+            http_push: None,
 
             silent: false,
 
@@ -366,7 +370,20 @@ where
 
     pub async fn serve(&mut self, started: Instant) -> Result<()> {
         self.register().await?;
-        self.listen(started).await
+        match &self.http_push {
+            Some(http_push) => {
+                let listener = self.listen(started);
+                tokio::pin!(listener);
+                tokio::select! {
+                    result = &mut listener => result,
+                    result = http_push.run(self.storage.clone(), self.cancellation.clone()) => {
+                        result?;
+                        listener.await
+                    },
+                }
+            }
+            None => self.listen(started).await,
+        }
     }
 
     pub async fn register(&mut self) -> Result<()> {
@@ -713,6 +730,7 @@ pub struct Builder<N, C, I, A, S, L> {
     lake_house: Option<House>,
     authentication: bool,
     tls_server_config: Option<ServerConfig>,
+    http_push_config: Option<PathBuf>,
     silent: bool,
 
     cancellation: CancellationToken,
@@ -741,6 +759,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             lake_house: self.lake_house,
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
+            http_push_config: self.http_push_config,
             silent: self.silent,
             cancellation: self.cancellation,
         }
@@ -759,6 +778,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             lake_house: self.lake_house,
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
+            http_push_config: self.http_push_config,
             silent: self.silent,
 
             cancellation: self.cancellation,
@@ -778,6 +798,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             lake_house: self.lake_house,
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
+            http_push_config: self.http_push_config,
             silent: self.silent,
 
             cancellation: self.cancellation,
@@ -800,6 +821,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             lake_house: self.lake_house,
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
+            http_push_config: self.http_push_config,
             silent: self.silent,
 
             cancellation: self.cancellation,
@@ -821,6 +843,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             lake_house: self.lake_house,
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
+            http_push_config: self.http_push_config,
             silent: self.silent,
 
             cancellation: self.cancellation,
@@ -842,6 +865,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             lake_house: self.lake_house,
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
+            http_push_config: self.http_push_config,
             silent: self.silent,
 
             cancellation: self.cancellation,
@@ -883,6 +907,13 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             ..self
         }
     }
+    pub fn http_push_config(self, http_push_config: Option<PathBuf>) -> Self {
+        Self {
+            http_push_config,
+            ..self
+        }
+    }
+
     pub fn silent(self, silent: bool) -> Self {
         Self { silent, ..self }
     }
@@ -890,6 +921,12 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
 
 impl Builder<i32, String, Uuid, Url, Url, Url> {
     pub async fn build(self) -> Result<Broker<Controller<ArcDynStorage>, ArcDynStorage>> {
+        let http_push = self
+            .http_push_config
+            .as_deref()
+            .map(HttpPush::load)
+            .transpose()?;
+
         let meter_provider = self
             .otlp_endpoint_url
             .clone()
@@ -964,6 +1001,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             groups,
             sasl_config,
             tls_server_config: self.tls_server_config.map(Arc::new),
+            http_push,
 
             silent: self.silent,
             maintenance_interval: intervals.maintenance,

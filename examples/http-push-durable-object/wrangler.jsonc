@@ -1,0 +1,9 @@
+{
+  "name": "nisshi-http-consumer",
+  "main": "worker.js",
+  "compatibility_date": "2026-10-15",
+  "durable_objects": {
+    "bindings": [{ "name": "CONSUMERS", "class_name": "Consumer" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Consumer"] }]
+}

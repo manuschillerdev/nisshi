@@ -1,0 +1,11 @@
+{
+  "subscriptions": [
+    {
+      "group_id": "orders-http",
+      "topic": "orders",
+      "partition": 0,
+      "endpoint": "http://127.0.0.1:8787/consumers/orders",
+      "bearer_token_env": "PUSH_TOKEN"
+    }
+  ]
+}

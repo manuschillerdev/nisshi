@@ -38,6 +38,7 @@ use tracing_subscriber::filter::ParseError;
 
 pub mod broker;
 pub mod coordinator;
+pub mod http_push;
 pub mod otel;
 pub mod service;
 

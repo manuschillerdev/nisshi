@@ -113,6 +113,10 @@ pub(super) struct Arg {
     #[arg(long, requires = "key")]
     key_passphrase_file: Option<PathBuf>,
 
+    /// JSON file containing HTTP push subscriptions.
+    #[arg(long, env = "HTTP_PUSH_CONFIG")]
+    http_push_config: Option<PathBuf>,
+
     /// Silent
     #[arg(long)]
     silent: bool,
@@ -493,6 +497,7 @@ impl Arg {
             .listener(listener.clone())
             .authentication(self.authentication)
             .tls_server_config(tls_server_config)
+            .http_push_config(self.http_push_config)
             .silent(self.silent);
 
         #[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]

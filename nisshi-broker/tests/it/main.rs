@@ -36,6 +36,7 @@ pub mod fetch_wire;
 pub mod find_coordinator;
 pub mod get_telemetry_subscriptions;
 pub mod group_cache_miss;
+pub mod http_push;
 pub mod incremental_alter_configs;
 pub mod init_producer_id;
 pub mod join_invalid_session_timeout;
