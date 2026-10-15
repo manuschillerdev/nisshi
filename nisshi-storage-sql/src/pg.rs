@@ -76,9 +76,11 @@ use opentelemetry::metrics::Histogram;
 use opentelemetry::{KeyValue, metrics::Counter};
 use rand::{prelude::*, rng};
 use serde_json::Value;
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
-    net::{TcpStream, UnixStream},
+    net::TcpStream,
     runtime::Handle,
     sync::{OwnedSemaphorePermit, Semaphore},
     time::{Instant, timeout, timeout_at},
@@ -92,6 +94,7 @@ use tokio_postgres::{
     types::{ToSql, Type},
 };
 use tokio_postgres_rustls::MakeRustlsConnect;
+#[cfg(unix)]
 use tokio_util::either::Either;
 use tracing::{Instrument as _, debug, error, instrument, warn};
 use url::Url;
@@ -392,10 +395,29 @@ struct CancelFailed {
     error: Error,
 }
 
+/// The transport a cancel socket connects over: a Unix socket is a second
+/// variant only where [`Host::Unix`] can occur, since Postgres accepts one
+/// only on a Unix domain socket.
+#[cfg(unix)]
+type CancelTransport = Either<TcpStream, UnixStream>;
+#[cfg(not(unix))]
+type CancelTransport = TcpStream;
+
+/// Wraps a TCP connection as a [`CancelTransport`], matching whichever
+/// variant that type is on this platform.
+#[cfg(unix)]
+fn tcp_cancel_transport(stream: TcpStream) -> CancelTransport {
+    Either::Left(stream)
+}
+#[cfg(not(unix))]
+fn tcp_cancel_transport(stream: TcpStream) -> CancelTransport {
+    stream
+}
+
 /// A socket to one configured host, with the host name that TLS verifies
 /// and the name a log line gives the host.
 struct CancelSocket {
-    stream: Either<TcpStream, UnixStream>,
+    stream: CancelTransport,
     tls_hostname: Option<String>,
     host: String,
 }
@@ -488,11 +510,13 @@ impl CancelRequests {
 
             let connect = async {
                 match (hostaddrs.get(index), host) {
-                    (Some(addr), _) => TcpStream::connect((*addr, port)).await.map(Either::Left),
+                    (Some(addr), _) => TcpStream::connect((*addr, port))
+                        .await
+                        .map(tcp_cancel_transport),
 
                     (None, Host::Tcp(host)) => TcpStream::connect((host.as_str(), port))
                         .await
-                        .map(Either::Left),
+                        .map(tcp_cancel_transport),
 
                     #[cfg(unix)]
                     (None, Host::Unix(dir)) => {
@@ -539,7 +563,7 @@ impl CancelRequests {
 }
 
 /// The stream a cancel request travels on.
-type CancelStream = ClosedByPeer<Either<TcpStream, UnixStream>>;
+type CancelStream = ClosedByPeer<CancelTransport>;
 
 /// A stream whose shutdown also waits for the peer to close its side.
 struct ClosedByPeer<S> {
