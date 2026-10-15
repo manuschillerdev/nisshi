@@ -46,8 +46,6 @@ fn create_topic_with_records() -> (Broker, KafkaCli, String) {
 /// The tool prints the low watermark that the broker returns, the partition's new earliest offset.
 /// A user reads it to confirm what the deletion did.
 #[test]
-#[ignore = "the broker doesn't answer DeleteRecords: PostgreSQL's query fails, SQLite panics, \
-            and memory storage never replies (#835)"]
 fn delete_records_returns_the_new_low_watermark() {
     let (_broker, cli, topic) = create_topic_with_records();
 
@@ -64,8 +62,6 @@ fn delete_records_returns_the_new_low_watermark() {
 /// deleted before. A consumer that starts from the beginning then reads only the records the user
 /// kept.
 #[test]
-#[ignore = "the broker doesn't answer DeleteRecords: PostgreSQL's query fails, SQLite panics, \
-            and memory storage never replies (#835)"]
 fn earliest_offset_moves_to_the_offset_deleted_before() {
     let (_broker, cli, topic) = create_topic_with_records();
     _ = cli
@@ -82,8 +78,10 @@ fn earliest_offset_moves_to_the_offset_deleted_before() {
 /// The deletion must not change the partition's latest offset. A broker that numbers new records
 /// from a lower offset gives two records one offset, and consumers skip or repeat records.
 #[test]
-#[ignore = "the broker doesn't answer DeleteRecords: PostgreSQL's query fails, SQLite panics, \
-            and memory storage never replies (#835)"]
+#[cfg_attr(
+    feature = "memory",
+    ignore = "the latest offset is the newest batch's first offset plus 1, not the log end (#798)"
+)]
 fn latest_offset_is_kept_after_delete_records() {
     let (_broker, cli, topic) = create_topic_with_records();
     _ = cli
